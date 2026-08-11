@@ -14,7 +14,7 @@ const VECTOR_PREVIOUS_MANIFEST_KEY = "vectors:manifest:previous";
 type TestIndexShardManifest = {
   v: 1;
   generation?: string;
-  format?: "serialized" | "vector-entry-chunks";
+  format?: "serialized" | "bm25-entry-chunks" | "vector-entry-chunks";
   count?: number;
   shards: Array<{ scope: string; key: string; chars: number }>;
   chars: number;
@@ -364,7 +364,7 @@ describe("IndexPersistence", () => {
       set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
         if (scope.includes(":gen_fraction:")) {
           newShardWrites += 1;
-          if (newShardWrites > 3) {
+          if (newShardWrites > 10) {
             throw new Error("fractional shard size caused zero-width shards");
           }
         }
@@ -379,8 +379,9 @@ describe("IndexPersistence", () => {
 
     const manifest = await getBm25Manifest(kv);
     expect(manifest.generation).toBe("gen_fraction");
-    expect(manifest.shards.length).toBe(1);
-    expect(newShardWrites).toBe(1);
+    expect(manifest.shards.length).toBeGreaterThan(0);
+    expect(manifest.shards.length).toBeLessThan(10);
+    expect(newShardWrites).toBe(manifest.shards.length);
   });
 
   it("keeps the previous generation when a shard write fails before manifest commit", async () => {
@@ -886,6 +887,50 @@ describe("IndexPersistence", () => {
       null,
     ).load();
     expect(loaded.vector?.size).toBe(20);
+  });
+
+  it("streams BM25 shards without building one monolithic snapshot", async () => {
+    const bm25 = new SearchIndex();
+    for (let i = 0; i < 20; i++) {
+      bm25.add(
+        makeObs({
+          id: `obs_${i}`,
+          sessionId: `ses_${i % 3}`,
+          title: `streamed bm25 document ${i}`,
+          narrative: `persist searchable terms for document ${i}`,
+        }),
+      );
+    }
+    const monolithicSerialize = vi
+      .spyOn(bm25, "serialize")
+      .mockImplementation(() => {
+        throw new Error("monolithic BM25 serialization must not run");
+      });
+
+    const persistence = new IndexPersistence(kv as never, bm25, null, {
+      shardChars: 400,
+      createGeneration: () => "gen_streamed_bm25",
+    });
+    await persistence.save();
+
+    const manifest = await kv.get<TestIndexShardManifest>(
+      BM25_SCOPE,
+      BM25_MANIFEST_KEY,
+    );
+    expect(monolithicSerialize).not.toHaveBeenCalled();
+    expect(manifest).toMatchObject({
+      format: "bm25-entry-chunks",
+      count: 20,
+    });
+    expect(manifest!.shards.length).toBeGreaterThan(1);
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.bm25?.size).toBe(20);
+    expect(loaded.bm25?.search("document 17")[0]?.obsId).toBe("obs_17");
   });
 
   it("writes a large shard set sequentially to avoid state queue floods", async () => {

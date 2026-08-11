@@ -21,7 +21,7 @@ const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
 type IndexShardManifest = {
   v: 1;
   generation?: string;
-  format?: "serialized" | "vector-entry-chunks";
+  format?: "serialized" | "bm25-entry-chunks" | "vector-entry-chunks";
   count?: number;
   shards: Array<{ scope: string; key: string; chars: number }>;
   chars: number;
@@ -146,7 +146,7 @@ export class IndexPersistence {
       while (this.persistedGeneration < this.dirtyGeneration) {
         const targetGeneration = this.dirtyGeneration;
         try {
-          await this.saveBm25Index(this.bm25.serialize());
+          await this.saveBm25Index(this.bm25);
           if (this.vector) {
             await this.saveVectorIndex(this.vector);
           }
@@ -176,11 +176,8 @@ export class IndexPersistence {
     let bm25: SearchIndex | null = null;
     let vector: VectorIndex | null = null;
 
-    const bm25Data = await this.loadBm25Data();
-    if (bm25Data && typeof bm25Data === "string") {
-      bm25 = SearchIndex.deserialize(bm25Data);
-      this.persistedBm25Count = bm25.size;
-    }
+    bm25 = await this.loadBm25Index();
+    if (bm25) this.persistedBm25Count = bm25.size;
 
     vector = await this.loadVectorIndex();
     if (vector) {
@@ -222,12 +219,13 @@ export class IndexPersistence {
     this.logFailure(err);
   }
 
-  private async saveBm25Index(serialized: string): Promise<void> {
-    await this.saveShardedIndex(
-      serialized,
+  private async saveBm25Index(bm25: SearchIndex): Promise<void> {
+    await this.saveChunkedIndex(
+      bm25.serializeChunks(shardChars(this.options)),
       BM25_MANIFEST_KEY,
       BM25_KEY,
       BM25_SHARD_SCOPE_PREFIX,
+      { format: "bm25-entry-chunks", count: bm25.size },
     );
   }
 
@@ -238,27 +236,6 @@ export class IndexPersistence {
       VECTOR_KEY,
       VECTOR_SHARD_SCOPE_PREFIX,
       { format: "vector-entry-chunks", count: vector.size },
-    );
-  }
-
-  private async saveShardedIndex(
-    serialized: string,
-    manifestKey: string,
-    legacyKey: string,
-    scopePrefix: string,
-  ): Promise<void> {
-    const chunkSize = shardChars(this.options);
-    function* chunks(): Generator<string> {
-      for (let offset = 0; offset < serialized.length; offset += chunkSize) {
-        yield serialized.slice(offset, offset + chunkSize);
-      }
-    }
-    await this.saveChunkedIndex(
-      chunks(),
-      manifestKey,
-      legacyKey,
-      scopePrefix,
-      { format: "serialized" },
     );
   }
 
@@ -450,8 +427,139 @@ export class IndexPersistence {
     });
   }
 
-  private async loadBm25Data(): Promise<string | null> {
-    return this.loadShardedData(BM25_KEY, BM25_MANIFEST_KEY, "BM25");
+  private async loadBm25Index(): Promise<SearchIndex | null> {
+    const manifest = await this.readIndexValue<IndexShardManifest>(
+      KV.bm25Index,
+      BM25_MANIFEST_KEY,
+      "BM25",
+      "manifest",
+    );
+    if (
+      manifest.ok &&
+      manifest.value != null &&
+      typeof manifest.value === "object"
+    ) {
+      const loaded = await this.loadBm25Manifest(manifest.value);
+      if (loaded) return loaded;
+    }
+
+    const previous = await this.readIndexValue<IndexShardManifest>(
+      KV.bm25Index,
+      `${BM25_MANIFEST_KEY}${PREVIOUS_MANIFEST_SUFFIX}`,
+      "BM25",
+      "manifest",
+    );
+    if (
+      previous.ok &&
+      previous.value != null &&
+      typeof previous.value === "object"
+    ) {
+      const loaded = await this.loadBm25Manifest(previous.value);
+      if (loaded) {
+        logger.warn("index persistence: loaded previous BM25 generation");
+        return loaded;
+      }
+    }
+    if (!manifest.ok) return null;
+
+    const legacy = await this.readIndexValue<string>(
+      KV.bm25Index,
+      BM25_KEY,
+      "BM25",
+      "legacy",
+    );
+    if (!legacy.ok) return null;
+    return typeof legacy.value === "string"
+      ? SearchIndex.deserialize(legacy.value)
+      : null;
+  }
+
+  private async loadBm25Manifest(
+    manifest: IndexShardManifest,
+  ): Promise<SearchIndex | null> {
+    if (manifest.format === "bm25-entry-chunks") {
+      return this.loadBm25EntryChunks(manifest);
+    }
+    const serialized = await this.loadManifestData(manifest, "BM25");
+    return serialized === null ? null : SearchIndex.deserialize(serialized);
+  }
+
+  private async loadBm25EntryChunks(
+    manifest: IndexShardManifest,
+  ): Promise<SearchIndex | null> {
+    if (
+      manifest.v !== 1 ||
+      !Array.isArray(manifest.shards) ||
+      manifest.shards.length === 0 ||
+      !Number.isInteger(manifest.chars) ||
+      manifest.chars < 0 ||
+      !Number.isInteger(manifest.count) ||
+      (manifest.count as number) < 0 ||
+      manifest.shards.some((shard) => !isValidShardDescriptor(shard))
+    ) {
+      logger.warn("index persistence: BM25 shard manifest invalid");
+      return null;
+    }
+
+    const bm25 = new SearchIndex();
+    let chars = 0;
+    let entries = 0;
+    let docTerms = 0;
+    let metadataChunks = 0;
+    for (const shard of manifest.shards) {
+      const chunk = await this.kv
+        .get<string>(shard.scope, shard.key)
+        .catch(() => null);
+      if (typeof chunk !== "string") {
+        logger.warn("index persistence: BM25 shard missing", {
+          scope: shard.scope,
+          key: shard.key,
+        });
+        return null;
+      }
+      if (chunk.length !== shard.chars) {
+        logger.warn("index persistence: BM25 shard length mismatch", {
+          scope: shard.scope,
+          key: shard.key,
+          expected: shard.chars,
+          actual: chunk.length,
+        });
+        return null;
+      }
+      try {
+        const loaded = bm25.loadSerializedChunk(chunk);
+        if (loaded.type === "meta") metadataChunks++;
+        if (loaded.type === "entries") entries += loaded.rows;
+        if (loaded.type === "docTerms") docTerms += loaded.rows;
+      } catch (err) {
+        logger.warn("index persistence: BM25 shard invalid", {
+          scope: shard.scope,
+          key: shard.key,
+          message: errorMessage(err),
+        });
+        return null;
+      }
+      chars += chunk.length;
+    }
+    if (
+      chars !== manifest.chars ||
+      metadataChunks !== 1 ||
+      entries !== manifest.count ||
+      docTerms !== manifest.count ||
+      bm25.size !== manifest.count
+    ) {
+      logger.warn("index persistence: BM25 manifest totals mismatch", {
+        expectedChars: manifest.chars,
+        actualChars: chars,
+        expectedCount: manifest.count,
+        actualCount: bm25.size,
+        metadataChunks,
+        entries,
+        docTerms,
+      });
+      return null;
+    }
+    return bm25;
   }
 
   private async loadVectorIndex(): Promise<VectorIndex | null> {
@@ -577,62 +685,6 @@ export class IndexPersistence {
       return null;
     }
     return vector;
-  }
-
-  private async loadShardedData(
-    legacyKey: string,
-    manifestKey: string,
-    label: string,
-  ): Promise<string | null> {
-    const manifest = await this.readIndexValue<IndexShardManifest>(
-      KV.bm25Index,
-      manifestKey,
-      label,
-      "manifest",
-    );
-    // #797: some iii-state adapters return `undefined` (not `null`) for
-    // a missing key. The previous `value !== null` check passed
-    // undefined through to loadManifestData, which then crashed on
-    // `manifest.v` with TypeError. Treat both null and undefined as
-    // "no manifest" and fall through to the legacy path. The shape
-    // check stays so a malformed-but-present row still fails closed.
-    if (
-      manifest.ok &&
-      manifest.value != null &&
-      typeof manifest.value === "object"
-    ) {
-      const loaded = await this.loadManifestData(manifest.value, label);
-      if (loaded !== null) return loaded;
-    }
-
-    const previous = await this.readIndexValue<IndexShardManifest>(
-      KV.bm25Index,
-      `${manifestKey}${PREVIOUS_MANIFEST_SUFFIX}`,
-      label,
-      "manifest",
-    );
-    if (
-      previous.ok &&
-      previous.value != null &&
-      typeof previous.value === "object"
-    ) {
-      const loaded = await this.loadManifestData(previous.value, label);
-      if (loaded !== null) {
-        logger.warn(`index persistence: loaded previous ${label} generation`);
-        return loaded;
-      }
-    }
-    if (!manifest.ok) return null;
-
-    const legacy = await this.readIndexValue<string>(
-      KV.bm25Index,
-      legacyKey,
-      label,
-      "legacy",
-    );
-    if (!legacy.ok) return null;
-    if (legacy.value && typeof legacy.value === "string") return legacy.value;
-    return null;
   }
 
   private async readIndexValue<T>(

@@ -209,6 +209,155 @@ export class SearchIndex {
     });
   }
 
+  /**
+   * Emits independently parseable chunks so large indexes never require one
+   * V8-sized JSON string. Rows remain intact; an unusually large row may
+   * exceed maxChars, but the complete index is never materialized at once.
+   */
+  *serializeChunks(maxChars: number): Generator<string> {
+    const limit =
+      Number.isFinite(maxChars) && maxChars >= 1
+        ? Math.floor(maxChars)
+        : 2_000_000;
+
+    yield JSON.stringify({
+      v: 3,
+      type: "meta",
+      totalDocLength: this.totalDocLength,
+    });
+
+    function* chunkRows(
+      type: "entries" | "inverted" | "docTerms",
+      rows: Iterable<unknown>,
+    ): Generator<string> {
+      const prefix = `{"v":3,"type":"${type}","rows":[`;
+      const suffix = "]}";
+      let serializedRows: string[] = [];
+      let chars = prefix.length + suffix.length;
+
+      for (const row of rows) {
+        const serialized = JSON.stringify(row);
+        const nextChars =
+          chars + (serializedRows.length > 0 ? 1 : 0) + serialized.length;
+        if (serializedRows.length > 0 && nextChars > limit) {
+          yield `${prefix}${serializedRows.join(",")}${suffix}`;
+          serializedRows = [];
+          chars = prefix.length + suffix.length;
+        }
+        serializedRows.push(serialized);
+        chars += (serializedRows.length > 1 ? 1 : 0) + serialized.length;
+      }
+
+      if (serializedRows.length > 0) {
+        yield `${prefix}${serializedRows.join(",")}${suffix}`;
+      }
+    }
+
+    yield* chunkRows("entries", this.entries);
+    const inverted = this.invertedIndex;
+    function* invertedRows(): Generator<unknown> {
+      for (const [term, ids] of inverted) yield [term, Array.from(ids)];
+    }
+    yield* chunkRows("inverted", invertedRows());
+
+    const docTermCounts = this.docTermCounts;
+    function* docTermRows(): Generator<unknown> {
+      for (const [id, counts] of docTermCounts) {
+        yield [id, Array.from(counts)];
+      }
+    }
+    yield* chunkRows("docTerms", docTermRows());
+  }
+
+  /** Loads one independently serialized BM25 chunk. */
+  loadSerializedChunk(
+    json: string,
+  ): { type: "meta" | "entries" | "inverted" | "docTerms"; rows: number } {
+    const raw = JSON.parse(json) as Record<string, unknown>;
+    if (!raw || raw.v !== 3 || typeof raw.type !== "string") {
+      throw new Error("BM25 chunk has an invalid header");
+    }
+
+    if (raw.type === "meta") {
+      const totalDocLength = Number(raw.totalDocLength);
+      if (!Number.isFinite(totalDocLength) || totalDocLength < 0) {
+        throw new Error("BM25 metadata has an invalid document length");
+      }
+      this.totalDocLength = Math.floor(totalDocLength);
+      return { type: "meta", rows: 0 };
+    }
+
+    if (!Array.isArray(raw.rows)) {
+      throw new Error("BM25 chunk rows must be an array");
+    }
+
+    if (raw.type === "entries") {
+      for (const row of raw.rows) {
+        if (!Array.isArray(row) || row.length < 2 || typeof row[0] !== "string") {
+          throw new Error("BM25 entry row is invalid");
+        }
+        const entry = row[1] as Partial<IndexEntry> | null;
+        if (
+          !entry ||
+          typeof entry.obsId !== "string" ||
+          typeof entry.sessionId !== "string" ||
+          !Number.isInteger(entry.termCount) ||
+          (entry.termCount as number) < 0
+        ) {
+          throw new Error("BM25 entry payload is invalid");
+        }
+        this.entries.set(row[0], entry as IndexEntry);
+      }
+      return { type: "entries", rows: raw.rows.length };
+    }
+
+    if (raw.type === "inverted") {
+      for (const row of raw.rows) {
+        if (
+          !Array.isArray(row) ||
+          row.length < 2 ||
+          typeof row[0] !== "string" ||
+          !Array.isArray(row[1]) ||
+          row[1].some((id) => typeof id !== "string")
+        ) {
+          throw new Error("BM25 inverted-index row is invalid");
+        }
+        this.invertedIndex.set(row[0], new Set(row[1] as string[]));
+      }
+      this.sortedTerms = null;
+      return { type: "inverted", rows: raw.rows.length };
+    }
+
+    if (raw.type === "docTerms") {
+      for (const row of raw.rows) {
+        if (
+          !Array.isArray(row) ||
+          row.length < 2 ||
+          typeof row[0] !== "string" ||
+          !Array.isArray(row[1])
+        ) {
+          throw new Error("BM25 document-term row is invalid");
+        }
+        const counts = new Map<string, number>();
+        for (const count of row[1]) {
+          if (
+            !Array.isArray(count) ||
+            count.length < 2 ||
+            typeof count[0] !== "string" ||
+            !Number.isFinite(count[1])
+          ) {
+            throw new Error("BM25 document-term count is invalid");
+          }
+          counts.set(count[0], Number(count[1]));
+        }
+        this.docTermCounts.set(row[0], counts);
+      }
+      return { type: "docTerms", rows: raw.rows.length };
+    }
+
+    throw new Error("BM25 chunk has an unknown type");
+  }
+
   static deserialize(json: string): SearchIndex {
     try {
       const idx = new SearchIndex();
