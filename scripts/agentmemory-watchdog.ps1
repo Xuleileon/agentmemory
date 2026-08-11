@@ -107,6 +107,10 @@ function Start-ManagedStack {
     RedirectStandardError = $stderrPath
     PassThru = $true
   }
+  # iii defaults to verbose INFO output even when the AgentMemory config has
+  # console logging disabled. Keep warnings/errors for post-mortems without
+  # letting a long-running daemon grow an unbounded operational trace.
+  $env:RUST_LOG = 'warn'
   $process = Start-Process @startArgs
 
   Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding ascii
