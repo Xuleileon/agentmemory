@@ -15,6 +15,7 @@ const VECTOR_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
 const VECTOR_SHARD_SCOPE_PREFIX = `${KV.bm25Index}:vectors:`;
 const INDEX_SHARD_KEY = "data";
+const PREVIOUS_MANIFEST_SUFFIX = ":previous";
 const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
 
 type IndexShardManifest = {
@@ -271,6 +272,10 @@ export class IndexPersistence {
     const previous = await this.kv
       .get<IndexShardManifest>(KV.bm25Index, manifestKey)
       .catch(() => null);
+    const previousManifestKey = `${manifestKey}${PREVIOUS_MANIFEST_SUFFIX}`;
+    const rollback = await this.kv
+      .get<IndexShardManifest>(KV.bm25Index, previousManifestKey)
+      .catch(() => null);
     const generation =
       this.options.createGeneration?.() ?? createIndexGeneration();
     const shards: IndexShardManifest["shards"] = [];
@@ -312,6 +317,18 @@ export class IndexPersistence {
       shards,
       chars,
     };
+    if (previous?.v === 1 && Array.isArray(previous.shards)) {
+      try {
+        await this.kv.set<IndexShardManifest>(
+          KV.bm25Index,
+          previousManifestKey,
+          previous,
+        );
+      } catch (err) {
+        await this.deleteShards(shards, "previous_manifest_publish_rollback");
+        throw err;
+      }
+    }
     try {
       await this.kv.set<IndexShardManifest>(
         KV.bm25Index,
@@ -346,13 +363,15 @@ export class IndexPersistence {
     }
 
     await this.deleteKey(KV.bm25Index, legacyKey, "legacy_cleanup");
-    if (previous?.v === 1 && Array.isArray(previous.shards)) {
-      const currentShardIds = new Set(
-        shards.map((shard) => `${shard.scope}\0${shard.key}`),
+    if (rollback?.v === 1 && Array.isArray(rollback.shards)) {
+      const retainedShardIds = new Set(
+        [...shards, ...(previous?.shards ?? [])].map(
+          (shard) => `${shard.scope}\0${shard.key}`,
+        ),
       );
-      for (const shard of previous.shards) {
-        if (currentShardIds.has(`${shard.scope}\0${shard.key}`)) continue;
-        await this.deleteShards([shard], "previous_generation_cleanup");
+      for (const shard of rollback.shards) {
+        if (retainedShardIds.has(`${shard.scope}\0${shard.key}`)) continue;
+        await this.deleteShards([shard], "rollback_generation_cleanup");
       }
     }
   }
@@ -442,14 +461,33 @@ export class IndexPersistence {
       "vector",
       "manifest",
     );
-    if (!manifest.ok) return null;
-    if (manifest.value != null && typeof manifest.value === "object") {
-      if (manifest.value.format === "vector-entry-chunks") {
-        return this.loadVectorEntryChunks(manifest.value);
-      }
-      const serialized = await this.loadManifestData(manifest.value, "vector");
-      return serialized === null ? null : VectorIndex.deserialize(serialized);
+    if (
+      manifest.ok &&
+      manifest.value != null &&
+      typeof manifest.value === "object"
+    ) {
+      const loaded = await this.loadVectorManifest(manifest.value);
+      if (loaded) return loaded;
     }
+
+    const previous = await this.readIndexValue<IndexShardManifest>(
+      KV.bm25Index,
+      `${VECTOR_MANIFEST_KEY}${PREVIOUS_MANIFEST_SUFFIX}`,
+      "vector",
+      "manifest",
+    );
+    if (
+      previous.ok &&
+      previous.value != null &&
+      typeof previous.value === "object"
+    ) {
+      const loaded = await this.loadVectorManifest(previous.value);
+      if (loaded) {
+        logger.warn("index persistence: loaded previous vector generation");
+        return loaded;
+      }
+    }
+    if (!manifest.ok) return null;
 
     const legacy = await this.readIndexValue<string>(
       KV.bm25Index,
@@ -461,6 +499,16 @@ export class IndexPersistence {
     return typeof legacy.value === "string"
       ? VectorIndex.deserialize(legacy.value)
       : null;
+  }
+
+  private async loadVectorManifest(
+    manifest: IndexShardManifest,
+  ): Promise<VectorIndex | null> {
+    if (manifest.format === "vector-entry-chunks") {
+      return this.loadVectorEntryChunks(manifest);
+    }
+    const serialized = await this.loadManifestData(manifest, "vector");
+    return serialized === null ? null : VectorIndex.deserialize(serialized);
   }
 
   private async loadVectorEntryChunks(
@@ -542,7 +590,6 @@ export class IndexPersistence {
       label,
       "manifest",
     );
-    if (!manifest.ok) return null;
     // #797: some iii-state adapters return `undefined` (not `null`) for
     // a missing key. The previous `value !== null` check passed
     // undefined through to loadManifestData, which then crashed on
@@ -550,11 +597,32 @@ export class IndexPersistence {
     // "no manifest" and fall through to the legacy path. The shape
     // check stays so a malformed-but-present row still fails closed.
     if (
+      manifest.ok &&
       manifest.value != null &&
       typeof manifest.value === "object"
     ) {
-      return this.loadManifestData(manifest.value, label);
+      const loaded = await this.loadManifestData(manifest.value, label);
+      if (loaded !== null) return loaded;
     }
+
+    const previous = await this.readIndexValue<IndexShardManifest>(
+      KV.bm25Index,
+      `${manifestKey}${PREVIOUS_MANIFEST_SUFFIX}`,
+      label,
+      "manifest",
+    );
+    if (
+      previous.ok &&
+      previous.value != null &&
+      typeof previous.value === "object"
+    ) {
+      const loaded = await this.loadManifestData(previous.value, label);
+      if (loaded !== null) {
+        logger.warn(`index persistence: loaded previous ${label} generation`);
+        return loaded;
+      }
+    }
+    if (!manifest.ok) return null;
 
     const legacy = await this.readIndexValue<string>(
       KV.bm25Index,

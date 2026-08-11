@@ -9,6 +9,7 @@ const BM25_LEGACY_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
 const VECTOR_LEGACY_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
+const VECTOR_PREVIOUS_MANIFEST_KEY = "vectors:manifest:previous";
 
 type TestIndexShardManifest = {
   v: 1;
@@ -605,6 +606,50 @@ describe("IndexPersistence", () => {
       null,
     ).load();
     expect(loaded.bm25!.search("bravo").length).toBe(1);
+    expect(loaded.vector!.size).toBe(1);
+    expect(
+      loaded.vector!.search(new Float32Array([0.1, 0.2, 0.3]))[0]?.obsId,
+    ).toBe("obs_old");
+  });
+
+  it("falls back to the previous vector generation when the current shard is missing", async () => {
+    const previousBm25 = makeBm25("obs_old", "alpha previous snapshot");
+    const previousVector = makeVector("obs_old");
+    await new IndexPersistence(kv as never, previousBm25, previousVector, {
+      shardChars: 80,
+      createGeneration: () => "gen_old",
+    }).save();
+
+    const nextBm25 = makeBm25("obs_new", "bravo current snapshot");
+    const nextVector = new VectorIndex();
+    nextVector.add("obs_new", "ses_1", new Float32Array([0.4, 0.5, 0.6]));
+    await new IndexPersistence(kv as never, nextBm25, nextVector, {
+      shardChars: 80,
+      createGeneration: () => "gen_new",
+    }).save();
+
+    const previousManifest = await kv.get<TestIndexShardManifest>(
+      BM25_SCOPE,
+      VECTOR_PREVIOUS_MANIFEST_KEY,
+    );
+    expect(previousManifest?.generation).toBe("gen_old");
+
+    const currentManifest = await kv.get<TestIndexShardManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    expect(currentManifest?.generation).toBe("gen_new");
+    await kv.delete(
+      currentManifest!.shards[0].scope,
+      currentManifest!.shards[0].key,
+    );
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector).not.toBeNull();
     expect(loaded.vector!.size).toBe(1);
     expect(
       loaded.vector!.search(new Float32Array([0.1, 0.2, 0.3]))[0]?.obsId,
