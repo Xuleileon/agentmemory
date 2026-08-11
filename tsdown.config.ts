@@ -15,6 +15,7 @@ const hookEntries = [
   "src/hooks/session-end.ts",
   "src/hooks/post-commit.ts",
   "src/hooks/antigravity-bridge.ts",
+  "src/hooks/cursor-bridge.ts",
 ];
 
 const shared = {
