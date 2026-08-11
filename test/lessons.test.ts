@@ -229,8 +229,9 @@ describe("Lessons", () => {
     });
 
     it("respects limit", async () => {
-      const result = (await sdk.trigger("mem::lesson-list", { limit: 1 })) as { lessons: Lesson[] };
+      const result = (await sdk.trigger("mem::lesson-list", { limit: 1 })) as { lessons: Lesson[]; total: number };
       expect(result.lessons.length).toBe(1);
+      expect(result.total).toBe(3);
     });
   });
 

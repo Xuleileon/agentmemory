@@ -40,4 +40,12 @@ describe("memories + export pagination (#544)", () => {
     expect(viewer).toMatch(/memories\?latest=true&limit=500/);
     expect(viewer).toMatch(/memories\?latest=true&limit=2000/);
   });
+
+  it("viewer dashboard renders list totals instead of page lengths", () => {
+    const viewer = readFileSync("src/viewer/index.html", "utf-8");
+    expect(viewer).toMatch(/memoryTotal/);
+    expect(viewer).toMatch(/lessonTotal/);
+    expect(viewer).toMatch(/crystalTotal/);
+    expect(viewer).not.toMatch(/value\)' \+ d\.memories\.length/);
+  });
 });

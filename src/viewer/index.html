@@ -1110,7 +1110,7 @@
 
     var state = {
       activeTab: 'dashboard',
-      dashboard: { loaded: false, health: null, sessions: [], sessionsLoaded: false, sessionTotal: 0, activeSessions: 0, totalObservations: 0, memories: [], graphStats: null, recentAudit: [], lessons: [], crystals: [] },
+      dashboard: { loaded: false, health: null, sessions: [], sessionsLoaded: false, sessionTotal: 0, activeSessions: 0, totalObservations: 0, memories: [], memoryTotal: 0, graphStats: null, recentAudit: [], lessons: [], lessonTotal: 0, crystals: [], crystalTotal: 0 },
       graph: { loaded: false, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
       memories: { loaded: false, items: [], search: '', typeFilter: '' },
       timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 50 },
@@ -1375,12 +1375,15 @@
         state.dashboard.activeSessions = state.dashboard.sessionsLoaded && typeof results[1].active === 'number' ? results[1].active : state.dashboard.sessions.filter(function(s) { return s.status === 'active'; }).length;
         state.dashboard.totalObservations = state.dashboard.sessionsLoaded && typeof results[1].totalObservations === 'number' ? results[1].totalObservations : state.dashboard.sessions.reduce(function(a, s) { return a + (s.observationCount || 0); }, 0);
         state.dashboard.memories = (results[2] && results[2].memories) || [];
+        state.dashboard.memoryTotal = results[2] && typeof results[2].total === 'number' ? results[2].total : state.dashboard.memories.length;
         state.dashboard.graphStats = results[3];
         state.dashboard.recentAudit = (results[4] && results[4].entries) || [];
         state.dashboard.semantic = (results[5] && results[5].facts) || (results[5] && results[5].semantic) || [];
         state.dashboard.procedural = (results[6] && results[6].procedures) || (results[6] && results[6].procedural) || [];
         state.dashboard.lessons = (results[8] && results[8].lessons) || [];
+        state.dashboard.lessonTotal = results[8] && typeof results[8].total === 'number' ? results[8].total : state.dashboard.lessons.length;
         state.dashboard.crystals = (results[9] && results[9].crystals) || [];
+        state.dashboard.crystalTotal = results[9] && typeof results[9].total === 'number' ? results[9].total : state.dashboard.crystals.length;
         state.dashboard.relations = (results[7] && results[7].relations) || [];
         state.dashboard.loaded = true;
         renderDashboard();
@@ -1437,9 +1440,9 @@
       }
       html += '<div class="stats-grid">';
       html += '<div class="stat-card"><div class="label">Sessions</div><div class="value">' + (sessionsAvailable ? sessionTotal : '&mdash;') + '</div><div class="sub">' + (sessionsAvailable ? activeSessions + ' active' : 'request failed') + '</div></div>';
-      html += '<div class="stat-card"><div class="label">Memories</div><div class="value">' + d.memories.length + '</div><div class="sub">latest versions</div></div>';
-      var lessonCount = (d.lessons || []).length;
-      var crystalCount = (d.crystals || []).length;
+      html += '<div class="stat-card"><div class="label">Memories</div><div class="value">' + (typeof d.memoryTotal === 'number' ? d.memoryTotal : d.memories.length) + '</div><div class="sub">latest versions</div></div>';
+      var lessonCount = typeof d.lessonTotal === 'number' ? d.lessonTotal : (d.lessons || []).length;
+      var crystalCount = typeof d.crystalTotal === 'number' ? d.crystalTotal : (d.crystals || []).length;
       html += '<div class="stat-card"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
       html += '<div class="stat-card"><div class="label">Crystals</div><div class="value">' + crystalCount + '</div><div class="sub">action digests</div></div>';
       html += '<div class="stat-card"><div class="label">Graph Nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' edges</div></div>';

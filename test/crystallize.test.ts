@@ -302,10 +302,11 @@ describe("Crystallize Functions", () => {
     it("respects limit", async () => {
       const result = (await sdk.trigger("mem::crystal-list", {
         limit: 1,
-      })) as { success: boolean; crystals: Crystal[] };
+      })) as { success: boolean; crystals: Crystal[]; total: number };
 
       expect(result.success).toBe(true);
       expect(result.crystals.length).toBe(1);
+      expect(result.total).toBe(3);
       expect(result.crystals[0].id).toBe("crys_3");
     });
   });

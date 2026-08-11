@@ -126,7 +126,7 @@ export function registerCrystallizeFunction(
           new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       );
 
-      return { success: true, crystals: crystals.slice(0, limit) };
+      return { success: true, crystals: crystals.slice(0, limit), total: crystals.length };
     },
   );
 

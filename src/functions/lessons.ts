@@ -174,7 +174,7 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
 
       lessons.sort((a, b) => b.confidence - a.confidence);
 
-      return { success: true, lessons: lessons.slice(0, limit) };
+      return { success: true, lessons: lessons.slice(0, limit), total: lessons.length };
     },
   );
 
