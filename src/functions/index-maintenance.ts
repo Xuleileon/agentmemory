@@ -43,6 +43,23 @@ export interface IndexMaintenanceOptions {
 
 export interface IndexMaintenanceController {
   rebuild: (data?: { batchSize?: number }) => Promise<IndexRebuildResult>;
+  startRebuild: (data?: { batchSize?: number }) => IndexRebuildStartResult;
+  getRebuildStatus: () => IndexRebuildJobStatus;
+}
+
+export type IndexRebuildState = "idle" | "running" | "succeeded" | "failed";
+
+export interface IndexRebuildJobStatus {
+  state: IndexRebuildState;
+  batchSize?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  result?: IndexRebuildResult;
+  error?: string;
+}
+
+export interface IndexRebuildStartResult extends IndexRebuildJobStatus {
+  accepted: boolean;
 }
 
 const SESSION_READ_BATCH = 10;
@@ -149,11 +166,19 @@ export function registerIndexMaintenanceFunctions(
   options: IndexMaintenanceOptions,
 ): IndexMaintenanceController {
   let rebuildPromise: Promise<IndexRebuildResult> | null = null;
+  let rebuildStatus: IndexRebuildJobStatus = { state: "idle" };
 
   const rebuild = (data: { batchSize?: number } = {}): Promise<IndexRebuildResult> => {
     if (rebuildPromise) return rebuildPromise;
 
-    rebuildPromise = (async () => {
+    const startedAt = new Date().toISOString();
+    rebuildStatus = {
+      state: "running",
+      ...(data.batchSize ? { batchSize: data.batchSize } : {}),
+      startedAt,
+    };
+
+    const task = (async () => {
       const generationBefore = options.persistence.getStatus().dirtyGeneration;
       const replacement = await buildReplacementIndexes(
         kv,
@@ -210,18 +235,55 @@ export function registerIndexMaintenanceFunctions(
         };
       }
       return publicResult(replacement);
-    })().finally(() => {
-      rebuildPromise = null;
     });
+
+    rebuildPromise = task()
+      .then((result) => {
+        rebuildStatus = {
+          state: result.success ? "succeeded" : "failed",
+          ...(data.batchSize ? { batchSize: data.batchSize } : {}),
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          result,
+          ...(result.error ? { error: result.error } : {}),
+        };
+        return result;
+      })
+      .catch((err: unknown) => {
+        rebuildStatus = {
+          state: "failed",
+          ...(data.batchSize ? { batchSize: data.batchSize } : {}),
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          error: message(err),
+        };
+        throw err;
+      })
+      .finally(() => {
+        rebuildPromise = null;
+      });
 
     return rebuildPromise;
   };
+
+  const startRebuild = (
+    data: { batchSize?: number } = {},
+  ): IndexRebuildStartResult => {
+    const accepted = rebuildPromise === null;
+    void rebuild(data).catch((err: unknown) => {
+      logger.error("background index rebuild failed", { error: message(err) });
+    });
+    return { accepted, ...rebuildStatus };
+  };
+
+  const getRebuildStatus = (): IndexRebuildJobStatus => ({ ...rebuildStatus });
 
   sdk.registerFunction("mem::index-status", async () => ({
     success: true,
     ...options.persistence.getStatus(),
     provider: options.embeddingProvider?.name ?? null,
     dimensions: options.embeddingProvider?.dimensions ?? 0,
+    rebuild: getRebuildStatus(),
   }));
 
   sdk.registerFunction("mem::index-flush", async () => {
@@ -235,6 +297,10 @@ export function registerIndexMaintenanceFunctions(
     };
   });
 
-  sdk.registerFunction("mem::index-rebuild", rebuild);
-  return { rebuild };
+  sdk.registerFunction(
+    "mem::index-rebuild",
+    async (data: { batchSize?: number; background?: boolean } = {}) =>
+      data.background ? startRebuild(data) : rebuild(data),
+  );
+  return { rebuild, startRebuild, getRebuildStatus };
 }

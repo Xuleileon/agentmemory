@@ -374,9 +374,9 @@ export function registerApiTriggers(
       }
       const result = await sdk.trigger({
         function_id: "mem::index-rebuild",
-        payload: { batchSize },
+        payload: { batchSize, background: true },
       });
-      return { status_code: 200, body: result };
+      return { status_code: 202, body: result };
     },
   );
   sdk.registerTrigger({

@@ -968,7 +968,7 @@ export const INDEX_MAINTENANCE_TOOLS: McpToolDef[] = [
   {
     name: "memory_index_rebuild",
     description:
-      "Expensive atomic full rebuild of BM25 and vector indexes. Builds off-path and swaps only after every embedding succeeds.",
+      "Start an expensive atomic full rebuild of BM25 and vector indexes in the background. Poll memory_index_status for completion; the active indexes swap only after every embedding succeeds.",
     inputSchema: {
       type: "object",
       properties: {

@@ -271,6 +271,51 @@ describe("atomic index maintenance", () => {
     });
   });
 
+  it("runs production rebuilds in the background and exposes their terminal status", async () => {
+    let releaseEmbedding!: (value: Float32Array[]) => void;
+    const deferredProvider: EmbeddingProvider = {
+      ...provider,
+      embedBatch: () =>
+        new Promise<Float32Array[]>((resolve) => {
+          releaseEmbedding = resolve;
+        }),
+    };
+    const sdk = mockSdk();
+    registerIndexMaintenanceFunctions(
+      sdk as never,
+      mockKV({ memories: [memory("mem_background")] }) as never,
+      {
+        bm25: new SearchIndex(),
+        vector: new VectorIndex(),
+        embeddingProvider: deferredProvider,
+        persistence: {
+          save: vi.fn(async () => {}),
+          getStatus: () => ({ dirty: false, dirtyGeneration: 1 }),
+        },
+      },
+    );
+
+    const started = await Promise.race([
+      sdk.trigger("mem::index-rebuild", { batchSize: 1, background: true }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("background start blocked")), 25),
+      ),
+    ]) as Record<string, unknown>;
+    expect(started).toMatchObject({ accepted: true, state: "running" });
+
+    const running = await sdk.trigger("mem::index-status") as Record<string, any>;
+    expect(running.rebuild).toMatchObject({ state: "running", batchSize: 1 });
+
+    releaseEmbedding([new Float32Array([1, 0, 0])]);
+    await vi.waitFor(async () => {
+      const status = await sdk.trigger("mem::index-status") as Record<string, any>;
+      expect(status.rebuild).toMatchObject({
+        state: "succeeded",
+        result: { success: true, bm25Count: 1, vectorCount: 1 },
+      });
+    });
+  });
+
   it("honors an explicit positive embedding batch size", async () => {
     const embedBatch = vi.fn(async (texts: string[]) =>
       texts.map(() => new Float32Array([1, 0, 0])),

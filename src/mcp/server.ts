@@ -683,7 +683,10 @@ export function registerMcpEndpoints(
               function_id: functionId,
               payload:
                 name === "memory_index_rebuild"
-                  ? { batchSize: args.batchSize as number | undefined }
+                  ? {
+                      batchSize: args.batchSize as number | undefined,
+                      background: true,
+                    }
                   : {},
             });
             return {

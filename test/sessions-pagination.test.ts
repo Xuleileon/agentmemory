@@ -73,6 +73,25 @@ describe("session API pagination", () => {
     expect(kv.get).toHaveBeenCalledTimes(2);
   });
 
+  it("starts index rebuilds as background jobs instead of holding the HTTP invocation", async () => {
+    const sdk = mockSdk();
+    const startRebuild = vi.fn(async () => ({ accepted: true, state: "running" }));
+    sdk.registerFunction("mem::index-rebuild", startRebuild);
+    registerApiTriggers(sdk as never, mockKV([]) as never);
+
+    const response = await sdk.functions.get("api::index-rebuild")!({
+      body: { batchSize: 32 },
+      headers: {},
+    }) as { status_code: number; body: Record<string, unknown> };
+
+    expect(response.status_code).toBe(202);
+    expect(response.body).toMatchObject({ accepted: true, state: "running" });
+    expect(startRebuild).toHaveBeenCalledWith({
+      batchSize: 32,
+      background: true,
+    });
+  });
+
   it("bounds default and explicit replay responses", async () => {
     const sessions = Array.from({ length: 600 }, (_, index) => session(index));
     const kv = mockKV(sessions);
