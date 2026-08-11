@@ -239,4 +239,38 @@ describe("viewer session rendering", () => {
     expect(() => sandbox.switchTab("sessions")).not.toThrow();
     expect(tabButtons.some((button: any) => button.classList.contains("active"))).toBe(true);
   });
+
+  it("does not show first-run when the sessions request fails", async () => {
+    const { sandbox, getElement } = loadViewerSandbox();
+    sandbox.fetch = async (url: string) => {
+      if (url.includes("/agentmemory/sessions")) throw new Error("payload failed");
+      if (url.includes("/agentmemory/health")) {
+        return { ok: true, json: async () => ({ status: "degraded", health: {} }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+
+    await sandbox.loadDashboard();
+
+    const html = getElement("view-dashboard").innerHTML;
+    expect(html).not.toContain("First run");
+    expect(html).toContain("Sessions unavailable");
+  });
+
+  it("uses bounded session queries for large stores", async () => {
+    const { sandbox } = loadViewerSandbox();
+    const urls: string[] = [];
+    sandbox.fetch = async (url: string) => {
+      urls.push(url);
+      return { ok: true, json: async () => ({ sessions: [], total: 0 }) };
+    };
+
+    await sandbox.loadDashboard();
+    await sandbox.loadSessions();
+    await sandbox.loadReplay();
+
+    expect(urls.some((url) => url.includes("sessions?limit=5"))).toBe(true);
+    expect(urls.some((url) => url.includes("sessions?limit=100&offset=0"))).toBe(true);
+    expect(urls.some((url) => url.includes("replay/sessions?limit=500"))).toBe(true);
+  });
 });

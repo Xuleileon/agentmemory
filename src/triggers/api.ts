@@ -37,6 +37,49 @@ function parseOptionalInt(raw: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+const DEFAULT_SESSION_PAGE_SIZE = 100;
+const MAX_SESSION_PAGE_SIZE = 500;
+
+function sessionPageParams(req: ApiRequest): { limit: number; offset: number } {
+  const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
+  const rawOffset = parseOptionalInt(req.query_params?.["offset"]);
+  return {
+    limit: Math.max(
+      1,
+      Math.min(MAX_SESSION_PAGE_SIZE, rawLimit ?? DEFAULT_SESSION_PAGE_SIZE),
+    ),
+    offset: Math.max(0, rawOffset ?? 0),
+  };
+}
+
+function sortedSessionPage(
+  sessions: Session[],
+  req: ApiRequest,
+): {
+  sessions: Session[];
+  total: number;
+  active: number;
+  totalObservations: number;
+  limit: number;
+  offset: number;
+} {
+  const { limit, offset } = sessionPageParams(req);
+  const sorted = sessions.slice().sort((a, b) =>
+    (b.startedAt || "").localeCompare(a.startedAt || ""),
+  );
+  return {
+    sessions: sorted.slice(offset, offset + limit),
+    total: sessions.length,
+    active: sessions.filter((session) => session.status === "active").length,
+    totalObservations: sessions.reduce(
+      (total, session) => total + (session.observationCount || 0),
+      0,
+    ),
+    limit,
+    offset,
+  };
+}
+
 function checkAuth(
   req: ApiRequest,
   secret: string | undefined,
@@ -587,10 +630,8 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const sessions = await kv.list<Session>(KV.sessions);
-      sessions.sort((a, b) =>
-        (b.startedAt || "").localeCompare(a.startedAt || ""),
-      );
-      return { status_code: 200, body: { success: true, sessions } };
+      const page = sortedSessionPage(sessions, req);
+      return { status_code: 200, body: { success: true, ...page } };
     },
   );
   sdk.registerTrigger({
@@ -914,14 +955,28 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
+      if (req.query_params?.["projects"] === "true") {
+        const projects = Array.from(
+          new Set(
+            filtered
+              .map((session) => session.project)
+              .filter((project): project is string => Boolean(project)),
+          ),
+        ).sort();
+        return {
+          status_code: 200,
+          body: { projects, total: filtered.length },
+        };
+      }
+      const page = sortedSessionPage(filtered, req);
       // Bounded fan-out: each kv.get is a full engine invocation, so
       // Promise.all over hundreds of sessions saturates the invocation
       // pool. Batch in chunks of 10 (parallel within a chunk, sequential
       // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
+      // the requested page.
       const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
+      for (let batch = 0; batch < page.sessions.length; batch += 10) {
+        const chunk = page.sessions.slice(batch, batch + 10);
         const results = await Promise.all(
           chunk.map((s) =>
             kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
@@ -929,10 +984,13 @@ export function registerApiTriggers(
         );
         summaries.push(...results);
       }
-      const withSummary = filtered.map((s, i) =>
+      const withSummary = page.sessions.map((s, i) =>
         summaries[i] ? { ...s, summary: summaries[i] } : s,
       );
-      return { status_code: 200, body: { sessions: withSummary } };
+      return {
+        status_code: 200,
+        body: { ...page, sessions: withSummary },
+      };
     },
   );
   sdk.registerTrigger({

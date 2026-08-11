@@ -1110,18 +1110,18 @@
 
     var state = {
       activeTab: 'dashboard',
-      dashboard: { loaded: false, health: null, sessions: [], memories: [], graphStats: null, recentAudit: [], lessons: [], crystals: [] },
+      dashboard: { loaded: false, health: null, sessions: [], sessionsLoaded: false, sessionTotal: 0, activeSessions: 0, totalObservations: 0, memories: [], graphStats: null, recentAudit: [], lessons: [], crystals: [] },
       graph: { loaded: false, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
       memories: { loaded: false, items: [], search: '', typeFilter: '' },
       timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 50 },
-      sessions: { loaded: false, items: [], selectedId: null },
+      sessions: { loaded: false, items: [], selectedId: null, page: 0, pageSize: 100, total: 0, loadError: false },
       audit: { loaded: false, entries: [], opFilter: '' },
       activity: { loaded: false, observations: [], sessions: [], typeFilter: '' },
       lessons: { loaded: false, items: [], search: '' },
       actions: { loaded: false, items: [], frontier: [], statusFilter: '', search: '' },
       crystals: { loaded: false, items: [], search: '', lessonMap: {} },
       profile: { loaded: false, projects: [], selectedProject: '', data: null },
-      replay: { loaded: false, sessions: [], selectedId: '', timeline: null, cursor: 0, playing: false, speed: 1, timer: null, startAt: 0, offsetAt: 0 },
+      replay: { loaded: false, sessions: [], total: 0, selectedId: '', timeline: null, cursor: 0, playing: false, speed: 1, timer: null, startAt: 0, offsetAt: 0 },
       flagsConfig: null,
       flagsDismissed: {},
       ws: null
@@ -1358,7 +1358,7 @@
       try {
         var results = await Promise.all([
           api('health', { readErrorBody: true }),
-          apiGet('sessions'),
+          apiGet('sessions?limit=5'),
           apiGet('memories?latest=true&limit=500'),
           apiGet('graph/stats'),
           apiGet('audit?limit=5'),
@@ -1369,7 +1369,11 @@
           apiGet('crystals')
         ]);
         state.dashboard.health = results[0];
-        state.dashboard.sessions = (results[1] && results[1].sessions) || [];
+        state.dashboard.sessionsLoaded = !!(results[1] && Array.isArray(results[1].sessions));
+        state.dashboard.sessions = state.dashboard.sessionsLoaded ? results[1].sessions : [];
+        state.dashboard.sessionTotal = state.dashboard.sessionsLoaded && typeof results[1].total === 'number' ? results[1].total : state.dashboard.sessions.length;
+        state.dashboard.activeSessions = state.dashboard.sessionsLoaded && typeof results[1].active === 'number' ? results[1].active : state.dashboard.sessions.filter(function(s) { return s.status === 'active'; }).length;
+        state.dashboard.totalObservations = state.dashboard.sessionsLoaded && typeof results[1].totalObservations === 'number' ? results[1].totalObservations : state.dashboard.sessions.reduce(function(a, s) { return a + (s.observationCount || 0); }, 0);
         state.dashboard.memories = (results[2] && results[2].memories) || [];
         state.dashboard.graphStats = results[3];
         state.dashboard.recentAudit = (results[4] && results[4].entries) || [];
@@ -1408,7 +1412,9 @@
       var snap = h.health || {};
       var healthStatus = h.status || 'unknown';
       var dotClass = healthStatus === 'healthy' ? 'healthy' : healthStatus === 'degraded' ? 'degraded' : healthStatus === 'critical' ? 'critical' : '';
-      var activeSessions = d.sessions.filter(function(s) { return s.status === 'active'; }).length;
+      var sessionsAvailable = d.sessionsLoaded !== false;
+      var sessionTotal = typeof d.sessionTotal === 'number' ? d.sessionTotal : d.sessions.length;
+      var activeSessions = typeof d.activeSessions === 'number' ? d.activeSessions : d.sessions.filter(function(s) { return s.status === 'active'; }).length;
       var gs = d.graphStats || {};
       var nodeCount = gs.totalNodes !== undefined ? gs.totalNodes : (gs.nodes !== undefined ? gs.nodes : (gs.nodeCount || 0));
       var edgeCount = gs.totalEdges !== undefined ? gs.totalEdges : (gs.edges !== undefined ? gs.edges : (gs.edgeCount || 0));
@@ -1418,7 +1424,9 @@
 
       var html = '';
       // First-run hero: empty dashboard = guided next step
-      if (d.sessions.length === 0) {
+      if (!sessionsAvailable) {
+        html += '<div class="card" style="margin-bottom:14px;border-left:3px solid var(--accent);"><div class="card-title">Sessions unavailable</div><div style="font-size:13px;color:var(--ink-muted);">The sessions request failed. Existing data was not treated as empty; retry after the server recovers.</div></div>';
+      } else if (sessionTotal === 0) {
         html += '<div class="card" style="margin-bottom:14px;padding:24px 28px;background:var(--bg-subtle);border-left:3px solid var(--accent);">' +
           '<div style="font-family:var(--font-ui);font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">First run &rarr; magical moment in 10 seconds</div>' +
           '<div style="font-family:var(--font-display,Lora,Georgia,serif);font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Seed sample data + prove semantic recall works</div>' +
@@ -1428,7 +1436,7 @@
           '</div>';
       }
       html += '<div class="stats-grid">';
-      html += '<div class="stat-card"><div class="label">Sessions</div><div class="value">' + d.sessions.length + '</div><div class="sub">' + activeSessions + ' active</div></div>';
+      html += '<div class="stat-card"><div class="label">Sessions</div><div class="value">' + (sessionsAvailable ? sessionTotal : '&mdash;') + '</div><div class="sub">' + (sessionsAvailable ? activeSessions + ' active' : 'request failed') + '</div></div>';
       html += '<div class="stat-card"><div class="label">Memories</div><div class="value">' + d.memories.length + '</div><div class="sub">latest versions</div></div>';
       var lessonCount = (d.lessons || []).length;
       var crystalCount = (d.crystals || []).length;
@@ -1444,10 +1452,10 @@
         html += '<div class="stat-card"><div class="label">Circuit Breaker</div><div class="value"><span class="cb-indicator ' + cbClass + '">' + esc(cb.state) + '</span></div>';
         html += '<div class="sub">' + (cb.failures || 0) + ' failures</div></div>';
       }
-      var totalObs = d.sessions.reduce(function(a, s) { return a + (s.observationCount || 0); }, 0);
+      var totalObs = typeof d.totalObservations === 'number' ? d.totalObservations : d.sessions.reduce(function(a, s) { return a + (s.observationCount || 0); }, 0);
       var tokenBudget = parseInt(new URLSearchParams(window.location.search).get('tokenBudget') || '2000', 10) || 2000;
       var estFull = totalObs * 80;
-      var estInjected = d.sessions.length * tokenBudget;
+      var estInjected = sessionTotal * tokenBudget;
       var savings = estFull > 0 ? Math.round((1 - estInjected / Math.max(estFull, 1)) * 100) : 0;
       if (savings < 0) savings = 0;
       var tokensSaved = Math.max(0, estFull - estInjected);
@@ -1512,7 +1520,9 @@
       html += '<div class="two-col">';
 
       html += '<div class="card"><div class="card-title">Recent Sessions</div>';
-      if (d.sessions.length === 0) {
+      if (!sessionsAvailable) {
+        html += '<div class="empty-state"><p>Sessions unavailable. Retry after the server recovers.</p></div>';
+      } else if (sessionTotal === 0) {
         html += '<div class="empty-state"><p>No sessions yet. Start a coding session with agentmemory hooks enabled.</p></div>';
       } else {
         var recent = d.sessions.slice().sort(function(a, b) { return (b.startedAt || '').localeCompare(a.startedAt || ''); }).slice(0, 5);
@@ -2547,7 +2557,7 @@
     async function loadTimeline() {
       var el = document.getElementById('view-timeline');
       el.innerHTML = '<div class="loading">Loading timeline...</div>';
-      var sessResult = await apiGet('sessions');
+      var sessResult = await apiGet('sessions?limit=500');
       var sessions = (sessResult && sessResult.sessions) || [];
       state.timeline.loaded = true;
 
@@ -2774,7 +2784,7 @@
       var el = document.getElementById('view-activity');
       el.innerHTML = '<div class="loading">Loading activity...</div>';
       var results = await Promise.all([
-        apiGet('sessions'),
+        apiGet('sessions?limit=5'),
         apiGet('audit?limit=200')
       ]);
       var sessions = (results[0] && results[0].sessions) || [];
@@ -2910,8 +2920,11 @@
     async function loadSessions() {
       var el = document.getElementById('view-sessions');
       el.innerHTML = '<div class="loading">Loading sessions...</div>';
-      var result = await apiGet('sessions');
-      state.sessions.items = (result && result.sessions) || [];
+      var offset = state.sessions.page * state.sessions.pageSize;
+      var result = await apiGet('sessions?limit=' + state.sessions.pageSize + '&offset=' + offset);
+      state.sessions.loadError = !(result && Array.isArray(result.sessions));
+      state.sessions.items = state.sessions.loadError ? [] : result.sessions;
+      state.sessions.total = state.sessions.loadError ? 0 : (typeof result.total === 'number' ? result.total : state.sessions.items.length);
       state.sessions.loaded = true;
       renderSessions();
     }
@@ -2923,7 +2936,9 @@
       });
 
       var html = '<div class="session-list">';
-      if (items.length === 0) {
+      if (state.sessions.loadError) {
+        html += '<div class="empty-state"><p>Sessions unavailable. The request failed; existing data was not treated as empty.</p></div>';
+      } else if (items.length === 0) {
         html += '<div class="empty-state"><div class="empty-icon">&#128466;</div><p>No sessions</p></div>';
       } else {
         items.forEach(function(s) {
@@ -2944,6 +2959,14 @@
         });
       }
       html += '</div>';
+      var totalPages = Math.max(1, Math.ceil(state.sessions.total / state.sessions.pageSize));
+      if (!state.sessions.loadError && totalPages > 1) {
+        html += '<div class="pagination">';
+        if (state.sessions.page > 0) html += '<button class="btn" data-action="sessions-page" data-page="' + (state.sessions.page - 1) + '">Prev</button>';
+        html += '<span style="color:var(--ink-faint);font-size:12px;padding:6px;font-family:var(--font-mono);">Page ' + (state.sessions.page + 1) + ' of ' + totalPages + ' (' + state.sessions.total + ' total)</span>';
+        if (state.sessions.page < totalPages - 1) html += '<button class="btn" data-action="sessions-page" data-page="' + (state.sessions.page + 1) + '">Next</button>';
+        html += '</div>';
+      }
       html += '<div id="session-detail"></div>';
       el.innerHTML = html;
 
@@ -2953,6 +2976,13 @@
     function selectSession(id) {
       state.sessions.selectedId = state.sessions.selectedId === id ? null : id;
       renderSessions();
+    }
+
+    function sessionsPage(page) {
+      state.sessions.page = page;
+      state.sessions.selectedId = null;
+      state.sessions.loaded = false;
+      loadSessions();
     }
 
     async function renderSessionDetail() {
@@ -3389,12 +3419,8 @@
     async function loadProfile() {
       var el = document.getElementById('view-profile');
       el.innerHTML = '<div class="loading">Loading profile...</div>';
-      var sessResult = await apiGet('sessions');
-      var sessions = (sessResult && sessResult.sessions) || [];
-
-      var projects = {};
-      sessions.forEach(function(s) { if (s.project) projects[s.project] = true; });
-      state.profile.projects = Object.keys(projects).sort();
+      var sessResult = await apiGet('sessions?projects=true');
+      state.profile.projects = (sessResult && sessResult.projects) || [];
       state.profile.loaded = true;
 
       if (state.profile.projects.length > 0 && !state.profile.selectedProject) {
@@ -3934,6 +3960,11 @@
         if (!Number.isNaN(page)) tlPage(page);
         return;
       }
+      if (action === 'sessions-page') {
+        var sessionsPageNumber = parseInt(target.getAttribute('data-page') || '', 10);
+        if (!Number.isNaN(sessionsPageNumber)) sessionsPage(sessionsPageNumber);
+        return;
+      }
       if (action === 'select-session') {
         var sessionId = target.getAttribute('data-session-id');
         if (sessionId) selectSession(sessionId);
@@ -3980,8 +4011,9 @@
     async function loadReplay() {
       var el = document.getElementById('view-replay');
       el.innerHTML = '<div class="loading">Loading sessions…</div>';
-      var res = await apiGet('replay/sessions');
+      var res = await apiGet('replay/sessions?limit=500');
       state.replay.sessions = (res && res.sessions) || [];
+      state.replay.total = res && typeof res.total === 'number' ? res.total : state.replay.sessions.length;
       state.replay.loaded = true;
       renderReplay();
     }
@@ -3994,6 +4026,7 @@
     function renderReplay() {
       var el = document.getElementById('view-replay');
       var sessions = state.replay.sessions || [];
+      var replayLimitNote = state.replay.total > sessions.length ? '<span style="font-size:11px;color:var(--ink-faint);">Showing newest ' + sessions.length + ' of ' + state.replay.total + '</span>' : '';
       var options = '<option value="">— pick a session —</option>' + sessions.map(function(s) {
         var id = sessionId(s);
         var label = sessionDisplayName(s) + ' · ' + (shortSessionId(s, 8) || 'missing id') + ' · ' + (s.observationCount || 0) + ' obs';
@@ -4007,7 +4040,7 @@
 
       el.innerHTML =
         '<div class="toolbar">' +
-          '<select id="replay-session-select">' + options + '</select>' +
+          '<select id="replay-session-select">' + options + '</select>' + replayLimitNote +
           '<button data-action="replay-refresh">Refresh</button>' +
           '<span class="sep"></span>' +
           '<input type="text" id="replay-import-path" placeholder="~/.claude/projects or file.jsonl" style="width:280px">' +
