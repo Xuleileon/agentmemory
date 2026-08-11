@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveDataDir } from "../src/cli-data-dir.js";
+import { renderIiiConfig } from "../src/cli/iii-config-runtime.js";
 
 describe("resolveDataDir", () => {
   it("prefers --data-dir over AGENTMEMORY_DATA_DIR", () => {
@@ -146,5 +147,30 @@ describe("resolveDataDir", () => {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(xdgDataHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe("renderIiiConfig", () => {
+  it("roots relative watch and worker exec paths at the selected config checkout", () => {
+    const rendered = renderIiiConfig(
+      `workers:\n  - name: iii-exec\n    config:\n      watch:\n        - src/**/*.ts\n      exec:\n        - node dist/index.mjs\n`,
+      "C:/state",
+      "E:/agentmemory/iii-config.yaml",
+    );
+
+    expect(rendered).toContain("- E:/agentmemory/src/**/*.ts");
+    expect(rendered).toContain("- node E:/agentmemory/dist/index.mjs");
+  });
+
+  it("preserves explicit absolute user watch and worker exec paths", () => {
+    const rendered = renderIiiConfig(
+      `workers:\n  - name: iii-exec\n    config:\n      watch:\n        - C:/custom/src/**/*.ts\n      exec:\n        - node C:/custom/dist/index.mjs\n`,
+      "C:/state",
+      "E:/agentmemory/iii-config.yaml",
+    );
+
+    expect(rendered).toContain("- C:/custom/src/**/*.ts");
+    expect(rendered).toContain("- node C:/custom/dist/index.mjs");
+    expect(rendered).not.toContain("E:/agentmemory/C:/custom");
   });
 });

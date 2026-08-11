@@ -1518,6 +1518,9 @@ Create `~/.agentmemory/.env`:
 | `GET` | `/agentmemory/profile` | Project profile |
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |
+| `GET` | `/agentmemory/index/status` | Compare in-memory and persisted BM25/vector counts |
+| `POST` | `/agentmemory/index/flush` | Force a durable index checkpoint |
+| `POST` | `/agentmemory/index/rebuild` | Atomic full BM25/vector rebuild |
 | `POST` | `/agentmemory/graph/query` | Knowledge graph query |
 | `POST` | `/agentmemory/team/share` | Share with team |
 | `GET` | `/agentmemory/audit` | Audit trail |
@@ -1538,6 +1541,40 @@ npm run test:integration  # API tests (requires running services)
 ```
 
 **Prerequisites:** Node.js >= 20, [iii-engine](https://iii.dev/docs) or Docker
+
+### Operating a pinned fork
+
+Keep the fork as `origin` and the official repository as `upstream`, then pin
+the worker config so a global npm install cannot silently start another
+checkout's `dist/index.mjs`:
+
+```bash
+git remote -v
+# origin   https://github.com/<you>/agentmemory.git
+# upstream https://github.com/rohitg00/agentmemory.git
+
+npm install
+npm test
+npm run build
+```
+
+Set this in `~/.agentmemory/.env` (use the real absolute checkout path):
+
+```env
+AGENTMEMORY_III_CONFIG=E:/agentmemory/iii-config.yaml
+```
+
+Then start the built fork with `node E:/agentmemory/dist/cli.mjs`. Relative
+`watch` and `node dist/index.mjs` entries are resolved against the selected
+config's checkout; explicit absolute entries remain unchanged. `agentmemory
+doctor` reports when the active worker executable comes from a different
+package root than the CLI.
+
+For upgrades, fetch and merge `upstream/main` into the fork without rewriting
+published history, rerun `npm test` and `npm run build`, inspect
+`/agentmemory/index/status`, restart once, and verify the same recalled record
+still appears. Do not switch production to a new build while index status is
+dirty or the in-memory and persisted vector counts differ.
 
 <h2 id="license"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-license.svg"><img src="assets/tags/section-license.svg" alt="License" height="32" /></picture></h2>
 

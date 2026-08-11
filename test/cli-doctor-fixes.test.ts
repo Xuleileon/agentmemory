@@ -24,6 +24,8 @@ function stubCtx(overrides: Partial<DoctorContext> = {}): DoctorContext {
     envPath: "/tmp/test/.agentmemory/.env",
     pidfilePath: "/tmp/test/.agentmemory/iii.pid",
     enginePath: "/tmp/test/.agentmemory/engine-state.json",
+    cliPackageRoot: "/work/agentmemory",
+    workerExecPath: "/work/agentmemory/dist/index.mjs",
     pinnedVersion: "0.11.2",
     ...overrides,
   };
@@ -58,6 +60,7 @@ describe("doctor v2 diagnostic catalog", () => {
     expect(DIAGNOSTIC_IDS).toContain("stale-pidfile");
     expect(DIAGNOSTIC_IDS).toContain("env-placeholder-keys");
     expect(DIAGNOSTIC_IDS).toContain("iii-on-path-not-local-bin");
+    expect(DIAGNOSTIC_IDS).toContain("worker-checkout-mismatch");
   });
 
   it("every diagnostic has check, fix, message, and fixPreview", () => {
@@ -179,6 +182,23 @@ describe("doctor v2 diagnostic catalog", () => {
     const check = diagnostics.find((d) => d.id === "iii-on-path-not-local-bin")!;
     const status = await check.check(stubCtx());
     expect(status.ok).toBe(false);
+    expect(check.manualOnly).toBe(true);
+  });
+
+  it("worker-checkout-mismatch reports a worker from another package root", async () => {
+    const diagnostics = buildDiagnostics(stubEffects());
+    const check = diagnostics.find((d) => d.id === "worker-checkout-mismatch")!;
+    const status = await check.check(
+      stubCtx({
+        cliPackageRoot: "E:/agentmemory",
+        workerExecPath:
+          "C:/Users/test/AppData/Roaming/npm/node_modules/@agentmemory/agentmemory/dist/index.mjs",
+      }),
+    );
+
+    expect(status.ok).toBe(false);
+    expect(status.detail).toContain("E:/agentmemory");
+    expect(status.detail).toContain("AppData/Roaming/npm");
     expect(check.manualOnly).toBe(true);
   });
 

@@ -66,6 +66,10 @@ import { knownAgents } from "./cli/connect/index.js";
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
 import { resolveDataDir } from "./cli-data-dir.js";
+import {
+  extractWorkerExecPath,
+  renderIiiConfig,
+} from "./cli/iii-config-runtime.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -417,28 +421,12 @@ function findIiiConfig(): string {
   return "";
 }
 
-function yamlSingleQuoted(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-function renderIiiConfig(template: string, dataDir: string): string {
-  return template
-    .replace(
-      "file_path: ./data/state_store.db",
-      `file_path: ${yamlSingleQuoted(join(dataDir, "state_store.db"))}`,
-    )
-    .replace(
-      "file_path: ./data/stream_store",
-      `file_path: ${yamlSingleQuoted(join(dataDir, "stream_store"))}`,
-    );
-}
-
 function writeRuntimeIiiConfig(configPath: string, dataDir: string): string {
   mkdirSync(dataDir, { recursive: true });
   const runtimeConfigPath = join(dataDir, "iii-config.yaml");
   writeFileSync(
     runtimeConfigPath,
-    renderIiiConfig(readFileSync(configPath, "utf8"), dataDir),
+    renderIiiConfig(readFileSync(configPath, "utf8"), dataDir, configPath),
   );
   return runtimeConfigPath;
 }
@@ -1631,6 +1619,25 @@ function checkClaudeCodeHooks(): CCHooksCheck {
 // inline, and re-checks only the affected diagnostic.
 
 function buildDoctorContext(): DoctorContext {
+  const packageRoot = [__dirname, dirname(__dirname)].find((candidate) =>
+    existsSync(join(candidate, "package.json")),
+  ) ?? dirname(__dirname);
+  const engineState = readEngineState();
+  const activeConfigPath =
+    engineState?.kind === "native" && existsSync(engineState.configPath)
+      ? engineState.configPath
+      : findIiiConfig();
+  let workerExecPath: string | null = null;
+  if (activeConfigPath && existsSync(activeConfigPath)) {
+    try {
+      const rendered = renderIiiConfig(
+        readFileSync(activeConfigPath, "utf-8"),
+        dataDirResolution.dataDir,
+        activeConfigPath,
+      );
+      workerExecPath = extractWorkerExecPath(rendered);
+    } catch {}
+  }
   return {
     baseUrl: getBaseUrl(),
     viewerUrl: getViewerUrl(),
@@ -1638,6 +1645,8 @@ function buildDoctorContext(): DoctorContext {
     pidfilePath: enginePidfilePath(),
     enginePath: engineStatePath(),
     pinnedVersion: IIPINNED_VERSION,
+    cliPackageRoot: packageRoot,
+    workerExecPath,
   };
 }
 

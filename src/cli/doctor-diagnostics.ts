@@ -16,6 +16,8 @@
 //   agentmemory doctor --all       # apply every available fix without prompting (CI)
 //   agentmemory doctor --dry-run   # show what each fix WOULD do; execute nothing
 
+import { workerPackageRoot } from "./iii-config-runtime.js";
+
 export type DiagnosticStatus = {
   ok: boolean;
   /** Short status detail (one line). Shown alongside the check name. */
@@ -40,6 +42,10 @@ export type DoctorContext = {
   enginePath: string;
   /** Pinned engine version (e.g. "0.11.2"). */
   pinnedVersion: string;
+  /** Package root containing the CLI currently executing. */
+  cliPackageRoot: string;
+  /** Absolute worker entrypoint parsed from the active iii config. */
+  workerExecPath: string | null;
 };
 
 export type Diagnostic = {
@@ -68,6 +74,7 @@ export const DIAGNOSTIC_IDS = [
   "stale-pidfile",
   "env-placeholder-keys",
   "iii-on-path-not-local-bin",
+  "worker-checkout-mismatch",
 ] as const;
 
 export type DiagnosticId = (typeof DIAGNOSTIC_IDS)[number];
@@ -306,6 +313,39 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
       fix: (ctx) => effects.openEditor(ctx.envPath),
     },
     {
+      id: "worker-checkout-mismatch",
+      message: "The iii worker executable comes from a different checkout than the CLI.",
+      fixPreview:
+        "Pin AGENTMEMORY_III_CONFIG to this checkout's iii-config.yaml, rebuild, and restart.",
+      moreInfo:
+        "A globally installed CLI can accidentally start dist/index.mjs from another package root. " +
+        "That makes source fixes appear installed while the engine keeps running stale worker code. " +
+        "The selected config now resolves relative worker paths against its own checkout; explicitly " +
+        "set AGENTMEMORY_III_CONFIG when operating a fork.",
+      manualOnly: true,
+      check: async (ctx) => {
+        if (!ctx.workerExecPath) {
+          return { ok: true, detail: "worker exec unavailable (engine not started)" };
+        }
+        const cliRoot = normalizeComparableRoot(ctx.cliPackageRoot);
+        const workerRoot = normalizeComparableRoot(
+          workerPackageRoot(ctx.workerExecPath),
+        );
+        return {
+          ok: cliRoot === workerRoot,
+          detail:
+            cliRoot === workerRoot
+              ? `worker: ${ctx.workerExecPath}`
+              : `CLI root: ${ctx.cliPackageRoot}; worker: ${ctx.workerExecPath}`,
+        };
+      },
+      fix: async () => ({
+        ok: false,
+        message:
+          "Set AGENTMEMORY_III_CONFIG to this checkout's iii-config.yaml, then rebuild and restart.",
+      }),
+    },
+    {
       id: "iii-on-path-not-local-bin",
       message:
         "iii is on PATH but not at agentmemory's private install path.",
@@ -335,6 +375,11 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         })),
     },
   ];
+}
+
+function normalizeComparableRoot(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[a-z]:\//i.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export type DoctorRunMode = "interactive" | "all" | "dry-run";
