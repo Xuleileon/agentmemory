@@ -183,7 +183,7 @@ export function registerIndexMaintenanceFunctions(
 
       options.bm25.restoreFrom(replacement.bm25);
       if (options.vector && replacement.vector) {
-        options.vector.restoreFrom(replacement.vector);
+        options.vector.adoptFrom(replacement.vector);
       } else if (options.vector) {
         options.vector.clear();
       }

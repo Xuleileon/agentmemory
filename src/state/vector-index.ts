@@ -121,6 +121,77 @@ export class VectorIndex {
     }
   }
 
+  /**
+   * Atomically transfers ownership of another index's backing map. Rebuilds
+   * use this instead of cloning every Float32Array, which would temporarily
+   * double multi-gigabyte vector stores at the exact moment they are saved.
+   */
+  adoptFrom(other: VectorIndex): void {
+    if (other === this) return;
+    this.vectors = other.vectors;
+    other.vectors = new Map();
+  }
+
+  /**
+   * Emits independently parseable JSON arrays without constructing one giant
+   * snapshot string. A single entry may exceed maxChars, but entries are never
+   * split; production's 2 MB shard size is far above one embedding row.
+   */
+  *serializeChunks(maxChars: number): Generator<string> {
+    const limit =
+      Number.isFinite(maxChars) && maxChars >= 1 ? Math.floor(maxChars) : 2_000_000;
+    let rows: string[] = [];
+    let chars = 2;
+
+    for (const [obsId, entry] of this.vectors) {
+      const row = JSON.stringify([
+        obsId,
+        {
+          embedding: float32ToBase64(entry.embedding),
+          sessionId: entry.sessionId,
+        },
+      ]);
+      const nextChars = chars + (rows.length > 0 ? 1 : 0) + row.length;
+      if (rows.length > 0 && nextChars > limit) {
+        yield `[${rows.join(",")}]`;
+        rows = [];
+        chars = 2;
+      }
+      rows.push(row);
+      chars += (rows.length > 1 ? 1 : 0) + row.length;
+    }
+
+    yield rows.length > 0 ? `[${rows.join(",")}]` : "[]";
+  }
+
+  /** Loads one independently serialized vector-entry chunk. */
+  loadSerializedChunk(json: string): number {
+    const data = JSON.parse(json) as unknown;
+    if (!Array.isArray(data)) throw new Error("vector chunk must be an array");
+    let loaded = 0;
+    for (const row of data) {
+      if (!Array.isArray(row) || row.length < 2) continue;
+      const [obsId, entry] = row;
+      if (
+        typeof obsId !== "string" ||
+        typeof entry?.embedding !== "string" ||
+        typeof entry?.sessionId !== "string"
+      ) {
+        continue;
+      }
+      try {
+        this.vectors.set(obsId, {
+          embedding: base64ToFloat32(entry.embedding),
+          sessionId: entry.sessionId,
+        });
+        loaded++;
+      } catch {
+        continue;
+      }
+    }
+    return loaded;
+  }
+
   serialize(): string {
     const data: Array<[string, { embedding: string; sessionId: string }]> = [];
     for (const [obsId, entry] of this.vectors) {
@@ -137,30 +208,10 @@ export class VectorIndex {
 
   static deserialize(json: string): VectorIndex {
     const idx = new VectorIndex();
-    let data: unknown;
     try {
-      data = JSON.parse(json);
+      idx.loadSerializedChunk(json);
     } catch {
       return idx;
-    }
-    if (!Array.isArray(data)) return idx;
-    for (const row of data) {
-      try {
-        if (!Array.isArray(row) || row.length < 2) continue;
-        const [obsId, entry] = row;
-        if (
-          typeof obsId !== "string" ||
-          typeof entry?.embedding !== "string" ||
-          typeof entry?.sessionId !== "string"
-        )
-          continue;
-        idx.vectors.set(obsId, {
-          embedding: base64ToFloat32(entry.embedding),
-          sessionId: entry.sessionId,
-        });
-      } catch {
-        continue;
-      }
     }
     return idx;
   }

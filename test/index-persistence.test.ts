@@ -13,6 +13,8 @@ const VECTOR_MANIFEST_KEY = "vectors:manifest";
 type TestIndexShardManifest = {
   v: 1;
   generation?: string;
+  format?: "serialized" | "vector-entry-chunks";
+  count?: number;
   shards: Array<{ scope: string; key: string; chars: number }>;
   chars: number;
 };
@@ -249,9 +251,14 @@ describe("IndexPersistence", () => {
       "ses_1",
       new Float32Array(Array.from({ length: 32 }, (_, i) => i)),
     );
+    vector.add(
+      "obs_2",
+      "ses_1",
+      new Float32Array(Array.from({ length: 32 }, (_, i) => i + 1)),
+    );
 
     const persistence = new IndexPersistence(kv as never, bm25, vector, {
-      shardChars: 40,
+      shardChars: 250,
       createGeneration: () => "gen_vector",
     });
     await persistence.save();
@@ -271,7 +278,7 @@ describe("IndexPersistence", () => {
 
     const loaded = await persistence.load();
     expect(loaded.vector).not.toBeNull();
-    expect(loaded.vector!.size).toBe(1);
+    expect(loaded.vector!.size).toBe(2);
   });
 
   it("persists empty vector snapshots so cleared vectors do not reload", async () => {
@@ -306,7 +313,7 @@ describe("IndexPersistence", () => {
   });
 
   it("avoids one oversized state::set string payload for persisted indexes", async () => {
-    const maxStringPayloadChars = 80;
+    const maxStringPayloadChars = 500;
     const bm25 = new SearchIndex();
     bm25.add(
       makeObs({
@@ -789,6 +796,86 @@ describe("IndexPersistence", () => {
     );
 
     await expect(persistence.load()).resolves.toBeDefined();
+  });
+
+  it("streams vector entry shards without building one monolithic snapshot", async () => {
+    const vector = new VectorIndex();
+    for (let i = 0; i < 20; i++) {
+      vector.add(
+        `obs_${i}`,
+        `ses_${i % 3}`,
+        new Float32Array(Array.from({ length: 32 }, (_, j) => i + j / 10)),
+      );
+    }
+    const monolithicSerialize = vi
+      .spyOn(vector, "serialize")
+      .mockImplementation(() => {
+        throw new Error("monolithic vector serialization must not run");
+      });
+
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      vector,
+      {
+        shardChars: 400,
+        createGeneration: () => "gen_streamed_vector",
+      },
+    );
+    await persistence.save();
+
+    const manifest = await kv.get<TestIndexShardManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    expect(monolithicSerialize).not.toHaveBeenCalled();
+    expect(manifest).toMatchObject({
+      format: "vector-entry-chunks",
+      count: 20,
+    });
+    expect(manifest!.shards.length).toBeGreaterThan(1);
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector?.size).toBe(20);
+  });
+
+  it("writes a large shard set sequentially to avoid state queue floods", async () => {
+    const bm25 = new SearchIndex();
+    bm25.add(
+      makeObs({
+        id: "obs_many_shards",
+        title: "bounded shard writes ".repeat(100),
+        narrative: "write queue pressure ".repeat(100),
+      }),
+    );
+    let activeShardWrites = 0;
+    let maxConcurrentShardWrites = 0;
+    const guardedKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope.includes(":gen_bounded:")) {
+          activeShardWrites++;
+          maxConcurrentShardWrites = Math.max(
+            maxConcurrentShardWrites,
+            activeShardWrites,
+          );
+          await Promise.resolve();
+          activeShardWrites--;
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+
+    await new IndexPersistence(guardedKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_bounded",
+    }).save();
+
+    expect(maxConcurrentShardWrites).toBe(1);
   });
 
   it("coalesces concurrent saves and persists writes that arrive during a save", async () => {

@@ -20,6 +20,8 @@ const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
 type IndexShardManifest = {
   v: 1;
   generation?: string;
+  format?: "serialized" | "vector-entry-chunks";
+  count?: number;
   shards: Array<{ scope: string; key: string; chars: number }>;
   chars: number;
 };
@@ -145,7 +147,7 @@ export class IndexPersistence {
         try {
           await this.saveBm25Index(this.bm25.serialize());
           if (this.vector) {
-            await this.saveVectorIndex(this.vector.serialize());
+            await this.saveVectorIndex(this.vector);
           }
           this.persistedGeneration = targetGeneration;
           this.persistedBm25Count = this.bm25.size;
@@ -179,9 +181,8 @@ export class IndexPersistence {
       this.persistedBm25Count = bm25.size;
     }
 
-    const vecData = await this.loadVectorData();
-    if (vecData && typeof vecData === "string") {
-      vector = VectorIndex.deserialize(vecData);
+    vector = await this.loadVectorIndex();
+    if (vector) {
       this.persistedVectorCount = vector.size;
     }
 
@@ -229,12 +230,13 @@ export class IndexPersistence {
     );
   }
 
-  private async saveVectorIndex(serialized: string): Promise<void> {
-    await this.saveShardedIndex(
-      serialized,
+  private async saveVectorIndex(vector: VectorIndex): Promise<void> {
+    await this.saveChunkedIndex(
+      vector.serializeChunks(shardChars(this.options)),
       VECTOR_MANIFEST_KEY,
       VECTOR_KEY,
       VECTOR_SHARD_SCOPE_PREFIX,
+      { format: "vector-entry-chunks", count: vector.size },
     );
   }
 
@@ -244,30 +246,50 @@ export class IndexPersistence {
     legacyKey: string,
     scopePrefix: string,
   ): Promise<void> {
+    const chunkSize = shardChars(this.options);
+    function* chunks(): Generator<string> {
+      for (let offset = 0; offset < serialized.length; offset += chunkSize) {
+        yield serialized.slice(offset, offset + chunkSize);
+      }
+    }
+    await this.saveChunkedIndex(
+      chunks(),
+      manifestKey,
+      legacyKey,
+      scopePrefix,
+      { format: "serialized" },
+    );
+  }
+
+  private async saveChunkedIndex(
+    chunks: Iterable<string>,
+    manifestKey: string,
+    legacyKey: string,
+    scopePrefix: string,
+    metadata: Pick<IndexShardManifest, "format" | "count">,
+  ): Promise<void> {
     const previous = await this.kv
       .get<IndexShardManifest>(KV.bm25Index, manifestKey)
       .catch(() => null);
     const generation =
       this.options.createGeneration?.() ?? createIndexGeneration();
-    const chunkChars = shardChars(this.options);
     const shards: IndexShardManifest["shards"] = [];
-    const chunks: string[] = [];
+    let chars = 0;
 
-    for (let offset = 0; offset < serialized.length; offset += chunkChars) {
-      const shardIndex = shards.length;
-      const scope = `${scopePrefix}${generation}:${String(shardIndex).padStart(
-        5,
-        "0",
-      )}`;
-      const chunk = serialized.slice(offset, offset + chunkChars);
-      shards.push({ scope, key: INDEX_SHARD_KEY, chars: chunk.length });
-      chunks.push(chunk);
-    }
-
-    const writeResults = await Promise.allSettled(
-      shards.map(async (shard, index) => {
-        const chunk = chunks[index] ?? "";
+    try {
+      for (const chunk of chunks) {
+        const shardIndex = shards.length;
+        const scope = `${scopePrefix}${generation}:${String(shardIndex).padStart(
+          5,
+          "0",
+        )}`;
+        const shard = { scope, key: INDEX_SHARD_KEY, chars: chunk.length };
+        // Record the intended shard before state::set. Some adapters can
+        // commit and then reject on an acknowledgement timeout; rollback must
+        // still delete that possibly-committed shard.
+        shards.push(shard);
         await this.kv.set(shard.scope, shard.key, chunk);
+        chars += chunk.length;
         await this.auditIndexPersistence("shard_write", [
           statePath(shard.scope, shard.key),
         ], {
@@ -277,21 +299,18 @@ export class IndexPersistence {
           generation,
           chars: chunk.length,
         });
-      }),
-    );
-    const failedWrite = writeResults.find(
-      (result): result is PromiseRejectedResult => result.status === "rejected",
-    );
-    if (failedWrite) {
+      }
+    } catch (err) {
       await this.deleteShards(shards, "shard_write_rollback");
-      throw failedWrite.reason;
+      throw err;
     }
 
     const nextManifest: IndexShardManifest = {
       v: 1,
       generation,
+      ...metadata,
       shards,
-      chars: serialized.length,
+      chars,
     };
     try {
       await this.kv.set<IndexShardManifest>(
@@ -304,7 +323,7 @@ export class IndexPersistence {
       ], {
         manifestKey,
         generation,
-        chars: serialized.length,
+        chars,
         shards: shards.length,
         result: "committed",
       });
@@ -315,7 +334,7 @@ export class IndexPersistence {
         ], {
           manifestKey,
           generation,
-          chars: serialized.length,
+          chars,
           shards: shards.length,
           result: "committed_after_error",
           error: errorMessage(err),
@@ -394,6 +413,8 @@ export class IndexPersistence {
       published?.v !== 1 ||
       published.generation !== expected.generation ||
       published.chars !== expected.chars ||
+      published.format !== expected.format ||
+      published.count !== expected.count ||
       !Array.isArray(published.shards) ||
       published.shards.length !== expected.shards.length
     ) {
@@ -414,8 +435,100 @@ export class IndexPersistence {
     return this.loadShardedData(BM25_KEY, BM25_MANIFEST_KEY, "BM25");
   }
 
-  private async loadVectorData(): Promise<string | null> {
-    return this.loadShardedData(VECTOR_KEY, VECTOR_MANIFEST_KEY, "vector");
+  private async loadVectorIndex(): Promise<VectorIndex | null> {
+    const manifest = await this.readIndexValue<IndexShardManifest>(
+      KV.bm25Index,
+      VECTOR_MANIFEST_KEY,
+      "vector",
+      "manifest",
+    );
+    if (!manifest.ok) return null;
+    if (manifest.value != null && typeof manifest.value === "object") {
+      if (manifest.value.format === "vector-entry-chunks") {
+        return this.loadVectorEntryChunks(manifest.value);
+      }
+      const serialized = await this.loadManifestData(manifest.value, "vector");
+      return serialized === null ? null : VectorIndex.deserialize(serialized);
+    }
+
+    const legacy = await this.readIndexValue<string>(
+      KV.bm25Index,
+      VECTOR_KEY,
+      "vector",
+      "legacy",
+    );
+    if (!legacy.ok) return null;
+    return typeof legacy.value === "string"
+      ? VectorIndex.deserialize(legacy.value)
+      : null;
+  }
+
+  private async loadVectorEntryChunks(
+    manifest: IndexShardManifest,
+  ): Promise<VectorIndex | null> {
+    if (
+      manifest.v !== 1 ||
+      !Array.isArray(manifest.shards) ||
+      manifest.shards.length === 0 ||
+      !Number.isInteger(manifest.chars) ||
+      manifest.chars < 0 ||
+      !Number.isInteger(manifest.count) ||
+      (manifest.count as number) < 0 ||
+      manifest.shards.some((shard) => !isValidShardDescriptor(shard))
+    ) {
+      logger.warn("index persistence: vector shard manifest invalid");
+      return null;
+    }
+
+    const vector = new VectorIndex();
+    let chars = 0;
+    let entries = 0;
+    for (const shard of manifest.shards) {
+      const chunk = await this.kv
+        .get<string>(shard.scope, shard.key)
+        .catch(() => null);
+      if (typeof chunk !== "string") {
+        logger.warn("index persistence: vector shard missing", {
+          scope: shard.scope,
+          key: shard.key,
+        });
+        return null;
+      }
+      if (chunk.length !== shard.chars) {
+        logger.warn("index persistence: vector shard length mismatch", {
+          scope: shard.scope,
+          key: shard.key,
+          expected: shard.chars,
+          actual: chunk.length,
+        });
+        return null;
+      }
+      try {
+        entries += vector.loadSerializedChunk(chunk);
+      } catch (err) {
+        logger.warn("index persistence: vector shard invalid", {
+          scope: shard.scope,
+          key: shard.key,
+          message: errorMessage(err),
+        });
+        return null;
+      }
+      chars += chunk.length;
+    }
+    if (
+      chars !== manifest.chars ||
+      entries !== manifest.count ||
+      vector.size !== manifest.count
+    ) {
+      logger.warn("index persistence: vector manifest totals mismatch", {
+        expectedChars: manifest.chars,
+        actualChars: chars,
+        expectedCount: manifest.count,
+        actualCount: vector.size,
+      });
+      return null;
+    }
+    return vector;
   }
 
   private async loadShardedData(

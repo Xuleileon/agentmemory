@@ -165,6 +165,8 @@ describe("atomic index maintenance", () => {
     activeVector.add("obs_old", "sess_old", new Float32Array([1, 0, 0]));
     const sdk = mockSdk();
     const save = vi.fn(async () => {});
+    expect(typeof (activeVector as any).adoptFrom).toBe("function");
+    const adoptFrom = vi.spyOn(activeVector as any, "adoptFrom");
     registerIndexMaintenanceFunctions(
       sdk as never,
       mockKV({
@@ -194,6 +196,7 @@ describe("atomic index maintenance", () => {
     expect(activeBm25.has("obs_new")).toBe(true);
     expect(activeBm25.has("mem_new")).toBe(true);
     expect(activeVector.size).toBe(2);
+    expect(adoptFrom).toHaveBeenCalledTimes(1);
     expect(save).toHaveBeenCalledTimes(1);
   });
 
