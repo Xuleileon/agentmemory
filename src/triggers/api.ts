@@ -1,4 +1,5 @@
 import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
+import { existsSync } from "node:fs";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -30,6 +31,11 @@ type Response = {
   headers?: Record<string, string>;
   body: unknown;
 };
+
+function isMaintenanceLocked(): boolean {
+  const lockFile = process.env.AGENTMEMORY_MAINTENANCE_LOCK_FILE?.trim();
+  return Boolean(lockFile && existsSync(lockFile));
+}
 
 function parseOptionalInt(raw: unknown): number | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
@@ -391,6 +397,12 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::observe",
     async (req: ApiRequest<HookPayload>): Promise<Response> => {
+      if (isMaintenanceLocked()) {
+        return {
+          status_code: 202,
+          body: { success: true, skipped: true, reason: "maintenance_lock" },
+        };
+      }
       const body = (req.body ?? {}) as Record<string, unknown>;
       const hookType = asNonEmptyString(body.hookType);
       const sessionId = asNonEmptyString(body.sessionId);
