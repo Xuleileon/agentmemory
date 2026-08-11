@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -6,7 +6,14 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { VERSION } from "../src/version.js";
-import { getSearchIndex } from "../src/functions/search.js";
+import {
+  getSearchIndex,
+  getVectorIndex,
+  setEmbeddingProvider,
+  setIndexPersistence,
+  setVectorIndex,
+} from "../src/functions/search.js";
+import { VectorIndex } from "../src/state/vector-index.js";
 import type {
   Session,
   CompressedObservation,
@@ -122,6 +129,12 @@ describe("Export/Import Functions", () => {
     await kv.set("mem:summaries", "ses_1", testSummary);
   });
 
+  afterEach(() => {
+    setEmbeddingProvider(null);
+    setVectorIndex(null);
+    setIndexPersistence(null);
+  });
+
   it("export produces valid ExportData structure", async () => {
     const result = (await sdk.trigger("mem::export", {})) as ExportData;
 
@@ -208,6 +221,41 @@ describe("Export/Import Functions", () => {
 
     const memHit = idx.search("postgres pooling");
     expect(memHit.some((r) => r.obsId === "mem_imported")).toBe(true);
+  });
+
+  it("imports memory and observation vectors and flushes one durable checkpoint", async () => {
+    const vector = new VectorIndex();
+    const persistence = {
+      scheduleSave: vi.fn(),
+      save: vi.fn(async () => {}),
+    };
+    setVectorIndex(vector);
+    setEmbeddingProvider({
+      name: "test-embedding",
+      dimensions: 3,
+      embed: vi.fn(async () => new Float32Array([1, 0, 0])),
+      embedBatch: vi.fn(async (texts: string[]) =>
+        texts.map(() => new Float32Array([1, 0, 0]))),
+    });
+    setIndexPersistence(persistence);
+
+    const importedObs = { ...testObs, id: "obs_vector", sessionId: "ses_vector" };
+    const importedMem = { ...testMemory, id: "mem_vector" };
+    const result = (await sdk.trigger("mem::import", {
+      strategy: "merge",
+      exportData: {
+        version: VERSION,
+        exportedAt: new Date().toISOString(),
+        sessions: [{ ...testSession, id: "ses_vector" }],
+        observations: { ses_vector: [importedObs] },
+        memories: [importedMem],
+        summaries: [],
+      },
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(getVectorIndex()?.size).toBe(2);
+    expect(persistence.save).toHaveBeenCalledTimes(1);
   });
 
   it("import with skip strategy does not overwrite existing", async () => {

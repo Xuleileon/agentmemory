@@ -30,7 +30,7 @@ import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
-import { indexRecords } from "./search.js";
+import { flushIndexSave, indexRecords } from "./search.js";
 import { logger } from "../logger.js";
 
 // Bounded-concurrency chunk size for the import delete/write loops. A
@@ -657,6 +657,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       // and the restart rebuild is the backstop.
       try {
         await indexRecords(indexObs, indexMems);
+        await flushIndexSave();
       } catch (err) {
         logger.warn("Import indexing failed; restart rebuild will recover", {
           error: err instanceof Error ? err.message : String(err),

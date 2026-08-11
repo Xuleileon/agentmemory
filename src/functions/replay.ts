@@ -15,7 +15,7 @@ import { parseJsonlText } from "../replay/jsonl-parser.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { indexRecords } from "./search.js";
+import { flushIndexSave, indexRecords } from "./search.js";
 import { logger } from "../logger.js";
 
 export const MAX_FILES_DEFAULT = 200;
@@ -461,6 +461,8 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           firstPrompt,
         );
       }
+
+      await flushIndexSave();
 
       await safeAudit(kv, "import", "mem::replay::import-jsonl", sessionIds, {
         source: "jsonl",

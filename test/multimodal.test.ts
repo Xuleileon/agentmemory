@@ -16,6 +16,7 @@ vi.mock("../src/functions/search.js", () => ({
     add: vi.fn(),
   }),
   vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
+  scheduleIndexSave: vi.fn(),
 }));
 
 const mockTrigger = vi.fn().mockResolvedValue(undefined);
@@ -47,6 +48,7 @@ const kv = mockKV() as any;
 
 import { registerObserveFunction } from "../src/functions/observe.js";
 import { registerCompressFunction } from "../src/functions/compress.js";
+import { scheduleIndexSave } from "../src/functions/search.js";
 import type { RawObservation, CompressedObservation, MemoryProvider } from "../src/types.js";
 
 const VALID_COMPRESS_XML = `<type>image</type>
@@ -70,6 +72,7 @@ describe("End-to-End Multimodal Flow", () => {
 
   beforeEach(() => {
     mockTrigger.mockClear();
+    vi.mocked(scheduleIndexSave).mockClear();
   });
 
   it("Step 1: Agent image should be successfully saved to hard drive", async () => {
@@ -161,6 +164,7 @@ describe("End-to-End Multimodal Flow", () => {
     expect(stored).not.toBeNull();
     expect(stored!.imageDescription).toBe("TEST_VISION_RESULT: I see a red dot");
     expect(stored!.imageRef).toBe(savedImagePath);
+    expect(scheduleIndexSave).toHaveBeenCalledTimes(1);
   });
 });
 

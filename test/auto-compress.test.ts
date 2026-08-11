@@ -79,13 +79,15 @@ describe("mem::observe auto-compress gate (#138)", () => {
     // test that sets the env var can be undermined by cached module
     // state from an earlier test (and vice versa).
     vi.resetModules();
-    delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
+    // Keep this suite hermetic when the developer's real
+    // ~/.agentmemory/.env enables auto-compress.
+    process.env["AGENTMEMORY_AUTO_COMPRESS"] = "false";
   });
   afterEach(() => {
     delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
   });
 
-  it("default (AGENTMEMORY_AUTO_COMPRESS unset): does NOT fire mem::compress", async () => {
+  it("AGENTMEMORY_AUTO_COMPRESS=false: does NOT fire mem::compress", async () => {
     const { registerObserveFunction } = await import(
       "../src/functions/observe.js"
     );
@@ -129,6 +131,25 @@ describe("mem::observe auto-compress gate (#138)", () => {
     expect(obs.title).toBe("Read");
     expect(obs.files).toContain("src/foo.ts");
     expect(obs.confidence).toBe(0.3);
+  });
+
+  it("default: schedules a durable checkpoint after indexing the synthetic observation", async () => {
+    const { registerObserveFunction } = await import(
+      "../src/functions/observe.js"
+    );
+    const { setIndexPersistence } = await import("../src/functions/search.js");
+    const scheduleSave = vi.fn();
+    const save = vi.fn(async () => {});
+    setIndexPersistence({ scheduleSave, save });
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await sdk.trigger("mem::observe", validPayload());
+
+    expect(scheduleSave).toHaveBeenCalledTimes(1);
+    expect(save).not.toHaveBeenCalled();
+    setIndexPersistence(null);
   });
 
   it("AGENTMEMORY_AUTO_COMPRESS=true: fires mem::compress exactly once", async () => {

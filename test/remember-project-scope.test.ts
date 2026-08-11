@@ -90,6 +90,24 @@ describe("mem::remember — project field stamping", () => {
     expect(stored?.project).toBe("api");
   });
 
+  it("schedules a durable checkpoint after indexing a saved memory", async () => {
+    const scheduleSave = vi.fn();
+    const save = vi.fn(async () => {});
+    setIndexPersistence({ scheduleSave, save });
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+
+    const result = await sdk.trigger({
+      function_id: "mem::remember",
+      payload: { content: "checkpoint this searchable memory", type: "fact" },
+    }) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(scheduleSave).toHaveBeenCalledTimes(1);
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it("leaves project undefined when not provided (backward-compat)", async () => {
     const sdk = mockSdk();
     const kv = mockKV();

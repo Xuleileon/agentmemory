@@ -13,6 +13,7 @@ import {
   getSearchIndex,
   setVectorIndex,
   setEmbeddingProvider,
+  setIndexPersistence,
 } from "../src/functions/search.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import type { EmbeddingProvider } from "../src/types.js";
@@ -182,6 +183,7 @@ describe("import-jsonl indexes observations into BM25 AND vector", () => {
   afterEach(() => {
     setVectorIndex(null);
     setEmbeddingProvider(null);
+    setIndexPersistence(null);
     getSearchIndex().clear();
   });
 
@@ -227,6 +229,22 @@ describe("import-jsonl indexes observations into BM25 AND vector", () => {
     expect(vectorIndex.size).toBeGreaterThan(0);
     expect(getSearchIndex().size).toBeGreaterThan(0);
     expect(vectorIndex.size).toBe(getSearchIndex().size);
+  });
+
+  it("flushes one durable checkpoint after the whole replay import", async () => {
+    writeFixture("sess-checkpoint");
+    const save = vi.fn(async () => {});
+    setIndexPersistence({ scheduleSave: vi.fn(), save });
+    const kv = mockKV();
+    const sdk = mockSdk(kv);
+    registerReplayFunctions(sdk, kv as never);
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: tmpRoot,
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(save).toHaveBeenCalledTimes(1);
   });
 
   it("skips the vector lane cleanly when no embedding provider is configured (keyless install)", async () => {
