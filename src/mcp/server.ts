@@ -659,6 +659,43 @@ export function registerMcpEndpoints(
             }
           }
 
+          case "memory_index_status":
+          case "memory_index_flush":
+          case "memory_index_rebuild": {
+            if (
+              name === "memory_index_rebuild" &&
+              args.batchSize !== undefined &&
+              (!Number.isInteger(args.batchSize) ||
+                (args.batchSize as number) < 1)
+            ) {
+              return {
+                status_code: 400,
+                body: { error: "batchSize must be a positive integer" },
+              };
+            }
+            const functionId =
+              name === "memory_index_status"
+                ? "mem::index-status"
+                : name === "memory_index_flush"
+                  ? "mem::index-flush"
+                  : "mem::index-rebuild";
+            const result = await sdk.trigger({
+              function_id: functionId,
+              payload:
+                name === "memory_index_rebuild"
+                  ? { batchSize: args.batchSize as number | undefined }
+                  : {},
+            });
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify(result, null, 2) },
+                ],
+              },
+            };
+          }
+
           case "memory_action_create": {
             if (typeof args.title !== "string" || !args.title.trim()) {
               return {

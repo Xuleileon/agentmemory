@@ -78,6 +78,31 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(receivedBody?.project).toBe("my-project");
   });
 
+  it("forwards all index maintenance tools through the full MCP proxy", async () => {
+    const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/mcp/call")) {
+        calls.push(JSON.parse((init?.body as string) || "{}"));
+        return new Response(
+          JSON.stringify({ content: [{ type: "text", text: "{}" }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await handleToolCall("memory_index_status", {});
+    await handleToolCall("memory_index_flush", {});
+    await handleToolCall("memory_index_rebuild", { batchSize: 16 });
+
+    expect(calls).toEqual([
+      { name: "memory_index_status", arguments: {} },
+      { name: "memory_index_flush", arguments: {} },
+      { name: "memory_index_rebuild", arguments: { batchSize: 16 } },
+    ]);
+  });
+
   it("proxies memory_recall to POST /agentmemory/search and forwards format/token_budget (#507)", async () => {
     const calls: Array<{ url: string; body?: unknown }> = [];
     installFetch((url, init) => {

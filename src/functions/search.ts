@@ -231,6 +231,7 @@ export interface IndexTargets {
   bm25: SearchIndex
   vector: VectorIndex | null
   embeddingProvider: EmbeddingProvider | null
+  batchSize?: number
 }
 
 export interface IndexRecordsResult {
@@ -255,7 +256,10 @@ export async function indexRecordsInto(
   memories: Memory[],
   targets: IndexTargets,
 ): Promise<IndexRecordsResult> {
-  const batchSize = getRebuildEmbedBatchSize()
+  const batchSize =
+    Number.isInteger(targets.batchSize) && (targets.batchSize as number) > 0
+      ? (targets.batchSize as number)
+      : getRebuildEmbedBatchSize()
   const vectorEnabled = Boolean(targets.vector && targets.embeddingProvider)
   const failedIds = new Set<string>()
   const pending: IndexEmbedJob[] = []

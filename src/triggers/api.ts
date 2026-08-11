@@ -284,6 +284,68 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction("api::index-status", async (): Promise<Response> => {
+    const result = await sdk.trigger({
+      function_id: "mem::index-status",
+      payload: {},
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::index-status",
+    config: {
+      api_path: "/agentmemory/index/status",
+      http_method: "GET",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::index-flush", async (): Promise<Response> => {
+    const result = await sdk.trigger({
+      function_id: "mem::index-flush",
+      payload: {},
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::index-flush",
+    config: {
+      api_path: "/agentmemory/index/flush",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction(
+    "api::index-rebuild",
+    async (req: ApiRequest): Promise<Response> => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const batchSize = parseOptionalPositiveInt(body.batchSize);
+      if (batchSize === null) {
+        return {
+          status_code: 400,
+          body: { error: "batchSize must be a positive integer" },
+        };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::index-rebuild",
+        payload: { batchSize },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::index-rebuild",
+    config: {
+      api_path: "/agentmemory/index/rebuild",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::observe",
     async (req: ApiRequest<HookPayload>): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;

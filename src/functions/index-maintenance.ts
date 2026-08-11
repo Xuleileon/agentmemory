@@ -42,7 +42,7 @@ export interface IndexMaintenanceOptions {
 }
 
 export interface IndexMaintenanceController {
-  rebuild: () => Promise<IndexRebuildResult>;
+  rebuild: (data?: { batchSize?: number }) => Promise<IndexRebuildResult>;
 }
 
 const SESSION_READ_BATCH = 10;
@@ -75,6 +75,7 @@ function publicResult(build: ReplacementIndexBuild): IndexRebuildResult {
 export async function buildReplacementIndexes(
   kv: StateKV,
   embeddingProvider: EmbeddingProvider | null,
+  options: { batchSize?: number } = {},
 ): Promise<ReplacementIndexBuild> {
   const bm25 = new SearchIndex();
   const vector = embeddingProvider ? new VectorIndex() : null;
@@ -92,6 +93,7 @@ export async function buildReplacementIndexes(
     bm25,
     vector,
     embeddingProvider,
+    batchSize: options.batchSize,
   });
   for (const id of memoryResult.failedIds) failedIds.add(id);
 
@@ -123,6 +125,7 @@ export async function buildReplacementIndexes(
       bm25,
       vector,
       embeddingProvider,
+      batchSize: options.batchSize,
     });
     for (const id of observationResult.failedIds) failedIds.add(id);
   }
@@ -147,7 +150,7 @@ export function registerIndexMaintenanceFunctions(
 ): IndexMaintenanceController {
   let rebuildPromise: Promise<IndexRebuildResult> | null = null;
 
-  const rebuild = (): Promise<IndexRebuildResult> => {
+  const rebuild = (data: { batchSize?: number } = {}): Promise<IndexRebuildResult> => {
     if (rebuildPromise) return rebuildPromise;
 
     rebuildPromise = (async () => {
@@ -155,6 +158,7 @@ export function registerIndexMaintenanceFunctions(
       const replacement = await buildReplacementIndexes(
         kv,
         options.embeddingProvider,
+        { batchSize: data.batchSize },
       );
       if (!replacement.success) return publicResult(replacement);
 

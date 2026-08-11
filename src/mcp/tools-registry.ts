@@ -3,7 +3,10 @@ export type McpToolDef = {
   description: string;
   inputSchema: {
     type: "object";
-    properties: Record<string, { type: string; description: string }>;
+    properties: Record<
+      string,
+      { type: string; description: string; minimum?: number }
+    >;
     required?: string[];
   };
 };
@@ -949,6 +952,36 @@ export const ESSENTIAL_TOOLS = new Set([
   "memory_reflect",
 ]);
 
+export const INDEX_MAINTENANCE_TOOLS: McpToolDef[] = [
+  {
+    name: "memory_index_status",
+    description:
+      "Inspect in-memory and persisted BM25/vector counts, dirty state, errors, and active embedding dimensions.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "memory_index_flush",
+    description:
+      "Force pending BM25/vector index changes to a durable checkpoint and return the resulting status.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "memory_index_rebuild",
+    description:
+      "Expensive atomic full rebuild of BM25 and vector indexes. Builds off-path and swaps only after every embedding succeeds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batchSize: {
+          type: "number",
+          description: "Optional positive embedding batch size (for example 16)",
+          minimum: 1,
+        },
+      },
+    },
+  },
+];
+
 export function getAllTools(): McpToolDef[] {
   return [
     ...CORE_TOOLS,
@@ -959,12 +992,13 @@ export function getAllTools(): McpToolDef[] {
     ...V070_TOOLS,
     ...V073_TOOLS,
     ...V010_SLOTS_TOOLS,
+    ...INDEX_MAINTENANCE_TOOLS,
   ];
 }
 
 // default switched from "core" (8 essential tools) to "all"
-// (full 54-tool surface). README and plugin manifests have always
-// advertised 54 tools "in proxy mode"; the old default left OpenCode /
+// (full 57-tool surface). README and plugin manifests advertise
+// 57 tools "in proxy mode"; the old default left OpenCode /
 // Claude Code users seeing 8 with no indication the other tools existed.
 // Users who want the lean essentials can still set AGENTMEMORY_TOOLS=core.
 export function getVisibleTools(): McpToolDef[] {

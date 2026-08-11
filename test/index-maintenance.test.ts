@@ -267,4 +267,21 @@ describe("atomic index maintenance", () => {
       dimensions: 3,
     });
   });
+
+  it("honors an explicit positive embedding batch size", async () => {
+    const embedBatch = vi.fn(async (texts: string[]) =>
+      texts.map(() => new Float32Array([1, 0, 0])),
+    );
+    const result = await buildReplacementIndexes(
+      mockKV({
+        memories: [memory("mem_1"), memory("mem_2")],
+      }) as never,
+      { ...provider, embedBatch },
+      { batchSize: 1 },
+    );
+
+    expect(result.success).toBe(true);
+    expect(embedBatch).toHaveBeenCalledTimes(2);
+    expect(embedBatch.mock.calls.every(([texts]) => texts.length === 1)).toBe(true);
+  });
 });

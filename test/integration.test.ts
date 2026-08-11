@@ -49,6 +49,27 @@ describe("agentmemory integration", () => {
     });
   });
 
+  describe("index maintenance", () => {
+    it("reports durable BM25/vector checkpoint status", async () => {
+      const res = await fetch(url("/agentmemory/index/status"), {
+        headers: authHeaders(),
+      });
+      expect(res.status).toBe(200);
+      const body = (await json(res)) as {
+        success: boolean;
+        dirty: boolean;
+        memoryBm25Count: number;
+        memoryVectorCount: number;
+        dimensions: number;
+      };
+      expect(body.success).toBe(true);
+      expect(typeof body.dirty).toBe("boolean");
+      expect(Number.isInteger(body.memoryBm25Count)).toBe(true);
+      expect(Number.isInteger(body.memoryVectorCount)).toBe(true);
+      expect(Number.isInteger(body.dimensions)).toBe(true);
+    });
+  });
+
   describe("session lifecycle", () => {
     it("starts a session", async () => {
       const res = await fetch(url("/agentmemory/session/start"), {
