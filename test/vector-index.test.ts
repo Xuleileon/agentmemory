@@ -15,6 +15,8 @@ describe("VectorIndex", () => {
   it("adds and retrieves vectors", () => {
     index.add("obs_1", "ses_1", new Float32Array([0.1, 0.2, 0.3]));
     expect(index.size).toBe(1);
+    expect(index.has("obs_1")).toBe(true);
+    expect(index.has("obs_missing")).toBe(false);
   });
 
   it("removes a vector", () => {

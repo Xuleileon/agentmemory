@@ -661,9 +661,10 @@ export function registerMcpEndpoints(
 
           case "memory_index_status":
           case "memory_index_flush":
+          case "memory_index_repair":
           case "memory_index_rebuild": {
             if (
-              name === "memory_index_rebuild" &&
+              (name === "memory_index_rebuild" || name === "memory_index_repair") &&
               args.batchSize !== undefined &&
               (!Number.isInteger(args.batchSize) ||
                 (args.batchSize as number) < 1)
@@ -673,18 +674,36 @@ export function registerMcpEndpoints(
                 body: { error: "batchSize must be a positive integer" },
               };
             }
+            if (
+              name === "memory_index_repair" &&
+              args.checkpointEvery !== undefined &&
+              (!Number.isInteger(args.checkpointEvery) ||
+                (args.checkpointEvery as number) < 1)
+            ) {
+              return {
+                status_code: 400,
+                body: { error: "checkpointEvery must be a positive integer" },
+              };
+            }
             const functionId =
               name === "memory_index_status"
                 ? "mem::index-status"
                 : name === "memory_index_flush"
                   ? "mem::index-flush"
-                  : "mem::index-rebuild";
+                  : name === "memory_index_repair"
+                    ? "mem::index-repair"
+                    : "mem::index-rebuild";
             const result = await sdk.trigger({
               function_id: functionId,
               payload:
-                name === "memory_index_rebuild"
+                name === "memory_index_rebuild" || name === "memory_index_repair"
                   ? {
                       batchSize: args.batchSize as number | undefined,
+                      ...(name === "memory_index_repair"
+                        ? {
+                            checkpointEvery: args.checkpointEvery as number | undefined,
+                          }
+                        : {}),
                       background: true,
                     }
                   : {},

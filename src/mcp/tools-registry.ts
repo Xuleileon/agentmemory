@@ -980,6 +980,26 @@ export const INDEX_MAINTENANCE_TOOLS: McpToolDef[] = [
       },
     },
   },
+  {
+    name: "memory_index_repair",
+    description:
+      "Resume-safe repair that scans source records, skips existing BM25/vector entries, embeds only missing vectors, and checkpoints progress for restart recovery.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batchSize: {
+          type: "number",
+          description: "Optional positive embedding batch size (for example 64)",
+          minimum: 1,
+        },
+        checkpointEvery: {
+          type: "number",
+          description: "Persist after this many repaired index entries (default 25000)",
+          minimum: 1,
+        },
+      },
+    },
+  },
 ];
 
 export function getAllTools(): McpToolDef[] {
@@ -997,8 +1017,8 @@ export function getAllTools(): McpToolDef[] {
 }
 
 // default switched from "core" (8 essential tools) to "all"
-// (full 57-tool surface). README and plugin manifests advertise
-// 57 tools "in proxy mode"; the old default left OpenCode /
+// (full 58-tool surface). README and plugin manifests advertise
+// 58 tools "in proxy mode"; the old default left OpenCode /
 // Claude Code users seeing 8 with no indication the other tools existed.
 // Users who want the lean essentials can still set AGENTMEMORY_TOOLS=core.
 export function getVisibleTools(): McpToolDef[] {

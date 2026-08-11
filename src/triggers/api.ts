@@ -368,6 +368,37 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction(
+    "api::index-repair",
+    async (req: ApiRequest): Promise<Response> => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const batchSize = parseOptionalPositiveInt(body.batchSize);
+      const checkpointEvery = parseOptionalPositiveInt(body.checkpointEvery);
+      if (batchSize === null || checkpointEvery === null) {
+        return {
+          status_code: 400,
+          body: {
+            error: "batchSize and checkpointEvery must be positive integers",
+          },
+        };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::index-repair",
+        payload: { batchSize, checkpointEvery, background: true },
+      });
+      return { status_code: 202, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::index-repair",
+    config: {
+      api_path: "/agentmemory/index/repair",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction(
     "api::index-rebuild",
     async (req: ApiRequest): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;

@@ -12,6 +12,7 @@ import { VectorIndex } from "../state/vector-index.js";
 import type { IndexPersistenceStatus } from "../state/index-persistence.js";
 import { indexRecordsInto } from "./search.js";
 import { logger } from "../logger.js";
+import { memoryToObservation } from "../state/memory-utils.js";
 
 export interface IndexRebuildResult {
   success: boolean;
@@ -45,6 +46,9 @@ export interface IndexMaintenanceController {
   rebuild: (data?: { batchSize?: number }) => Promise<IndexRebuildResult>;
   startRebuild: (data?: { batchSize?: number }) => IndexRebuildStartResult;
   getRebuildStatus: () => IndexRebuildJobStatus;
+  repair: (data?: IndexRepairOptions) => Promise<IndexRepairResult>;
+  startRepair: (data?: IndexRepairOptions) => IndexRepairStartResult;
+  getRepairStatus: () => IndexRepairJobStatus;
 }
 
 export type IndexRebuildState = "idle" | "running" | "succeeded" | "failed";
@@ -62,8 +66,51 @@ export interface IndexRebuildStartResult extends IndexRebuildJobStatus {
   accepted: boolean;
 }
 
+export interface IndexRepairOptions {
+  batchSize?: number;
+  checkpointEvery?: number;
+}
+
+export interface IndexRepairResult {
+  success: boolean;
+  scanned: number;
+  missing: number;
+  repaired: number;
+  failed: number;
+  failedIds: string[];
+  checkpoints: number;
+  bm25Count: number;
+  vectorCount: number;
+  dimensions: number;
+  error?: string;
+}
+
+export interface IndexRepairProgress {
+  scanned: number;
+  missing: number;
+  repaired: number;
+  failed: number;
+  checkpoints: number;
+}
+
+export interface IndexRepairJobStatus {
+  state: IndexRebuildState;
+  batchSize?: number;
+  checkpointEvery?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  progress?: IndexRepairProgress;
+  result?: IndexRepairResult;
+  error?: string;
+}
+
+export interface IndexRepairStartResult extends IndexRepairJobStatus {
+  accepted: boolean;
+}
+
 const SESSION_READ_BATCH = 10;
 const DEFAULT_EMBED_BATCH = 32;
+const DEFAULT_REPAIR_CHECKPOINT_EVERY = 25_000;
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -180,6 +227,223 @@ export async function buildReplacementIndexes(
   };
 }
 
+export async function repairMissingIndexes(
+  kv: StateKV,
+  options: IndexMaintenanceOptions,
+  controls: IndexRepairOptions = {},
+  onProgress?: (progress: IndexRepairProgress) => void,
+): Promise<IndexRepairResult> {
+  const vector = options.vector;
+  const embeddingProvider = options.embeddingProvider;
+  if (!vector || !embeddingProvider) {
+    return {
+      success: false,
+      scanned: 0,
+      missing: 0,
+      repaired: 0,
+      failed: 1,
+      failedIds: ["embedding-provider-unavailable"],
+      checkpoints: 0,
+      bm25Count: options.bm25.size,
+      vectorCount: vector?.size ?? 0,
+      dimensions: embeddingProvider?.dimensions ?? 0,
+      error: "embedding provider is not configured",
+    };
+  }
+
+  const batchSize =
+    Number.isInteger(controls.batchSize) && (controls.batchSize as number) > 0
+      ? (controls.batchSize as number)
+      : DEFAULT_EMBED_BATCH;
+  const checkpointEvery =
+    Number.isInteger(controls.checkpointEvery) &&
+    (controls.checkpointEvery as number) > 0
+      ? (controls.checkpointEvery as number)
+      : DEFAULT_REPAIR_CHECKPOINT_EVERY;
+  const failedIds = new Set<string>();
+  const pendingMemories: Memory[] = [];
+  const pendingObservations: CompressedObservation[] = [];
+  let scanned = 0;
+  let missing = 0;
+  let repaired = 0;
+  let checkpoints = 0;
+  let repairedSinceCheckpoint = 0;
+  let dirtySinceCheckpoint = false;
+
+  const progress = (): IndexRepairProgress => ({
+    scanned,
+    missing,
+    repaired,
+    failed: failedIds.size,
+    checkpoints,
+  });
+  const publish = (): void => onProgress?.(progress());
+
+  const checkpoint = async (): Promise<void> => {
+    if (!dirtySinceCheckpoint) return;
+    await options.persistence.save();
+    const status = options.persistence.getStatus();
+    if (status.dirty) {
+      throw new Error(
+        typeof status.lastError === "string"
+          ? status.lastError
+          : "index checkpoint remains dirty",
+      );
+    }
+    checkpoints++;
+    repairedSinceCheckpoint = 0;
+    dirtySinceCheckpoint = false;
+    publish();
+  };
+
+  const flushVectors = async (): Promise<void> => {
+    if (pendingMemories.length === 0 && pendingObservations.length === 0) return;
+    const memories = pendingMemories.splice(0, pendingMemories.length);
+    const observations = pendingObservations.splice(0, pendingObservations.length);
+    const queuedIds = [
+      ...memories.map((item) => item.id),
+      ...observations.map((item) => item.id),
+    ];
+    const sink = new SearchIndex();
+    const result = await indexRecordsInto(observations, memories, {
+      bm25: sink,
+      vector,
+      embeddingProvider,
+      batchSize,
+    });
+    for (const id of result.failedIds) failedIds.add(id);
+    for (const id of queuedIds) {
+      if (!failedIds.has(id) && vector.has(id) && options.bm25.has(id)) {
+        repaired++;
+        repairedSinceCheckpoint++;
+      }
+    }
+    if (result.vectorized > 0) dirtySinceCheckpoint = true;
+    if (repairedSinceCheckpoint >= checkpointEvery) await checkpoint();
+    publish();
+  };
+
+  const inspectMemory = async (memory: Memory): Promise<void> => {
+    if (memory.isLatest === false || !memory.title || !memory.content) return;
+    scanned++;
+    const missingBm25 = !options.bm25.has(memory.id);
+    const missingVector = !vector.has(memory.id);
+    if (!missingBm25 && !missingVector) return;
+    missing++;
+    if (missingBm25) {
+      try {
+        options.bm25.add(memoryToObservation(memory));
+        dirtySinceCheckpoint = true;
+      } catch (err) {
+        failedIds.add(memory.id);
+        logger.warn("index repair: BM25 memory write failed", {
+          id: memory.id,
+          error: message(err),
+        });
+      }
+    }
+    if (missingVector) {
+      pendingMemories.push(memory);
+      if (pendingMemories.length + pendingObservations.length >= batchSize) {
+        await flushVectors();
+      }
+    } else if (!failedIds.has(memory.id)) {
+      repaired++;
+      repairedSinceCheckpoint++;
+      if (repairedSinceCheckpoint >= checkpointEvery) await checkpoint();
+    }
+  };
+
+  const inspectObservation = async (obs: CompressedObservation): Promise<void> => {
+    if (!obs.title || !obs.narrative) return;
+    scanned++;
+    const missingBm25 = !options.bm25.has(obs.id);
+    const missingVector = !vector.has(obs.id);
+    if (!missingBm25 && !missingVector) return;
+    missing++;
+    if (missingBm25) {
+      try {
+        options.bm25.add(obs);
+        dirtySinceCheckpoint = true;
+      } catch (err) {
+        failedIds.add(obs.id);
+        logger.warn("index repair: BM25 observation write failed", {
+          id: obs.id,
+          error: message(err),
+        });
+      }
+    }
+    if (missingVector) {
+      pendingObservations.push(obs);
+      if (pendingMemories.length + pendingObservations.length >= batchSize) {
+        await flushVectors();
+      }
+    } else if (!failedIds.has(obs.id)) {
+      repaired++;
+      repairedSinceCheckpoint++;
+      if (repairedSinceCheckpoint >= checkpointEvery) await checkpoint();
+    }
+  };
+
+  let error: string | undefined;
+  try {
+    let memories: Memory[] = [];
+    try {
+      memories = await kv.list<Memory>(KV.memories);
+    } catch (err) {
+      failedIds.add(KV.memories);
+      logger.warn("index repair: failed to load memories", { error: message(err) });
+    }
+    for (const memory of memories) await inspectMemory(memory);
+
+    let sessions: Session[] = [];
+    try {
+      sessions = await kv.list<Session>(KV.sessions);
+    } catch (err) {
+      failedIds.add(KV.sessions);
+      logger.warn("index repair: failed to load sessions", { error: message(err) });
+    }
+    for (let offset = 0; offset < sessions.length; offset += SESSION_READ_BATCH) {
+      const chunk = sessions.slice(offset, offset + SESSION_READ_BATCH);
+      const observations = await Promise.all(
+        chunk.map(async (session) => {
+          try {
+            return await kv.list<CompressedObservation>(KV.observations(session.id));
+          } catch (err) {
+            failedIds.add(session.id);
+            logger.warn("index repair: failed to load session observations", {
+              sessionId: session.id,
+              error: message(err),
+            });
+            return [];
+          }
+        }),
+      );
+      for (const obs of observations.flat()) await inspectObservation(obs);
+      publish();
+    }
+    await flushVectors();
+    await checkpoint();
+  } catch (err) {
+    error = `index repair checkpoint failed: ${message(err)}`;
+  }
+
+  const failures = Array.from(failedIds);
+  return {
+    success: failures.length === 0 && error === undefined,
+    scanned,
+    missing,
+    repaired,
+    failed: failures.length + (error ? 1 : 0),
+    failedIds: error ? [...failures, "index-checkpoint"] : failures,
+    checkpoints,
+    bm25Count: options.bm25.size,
+    vectorCount: vector.size,
+    dimensions: embeddingProvider.dimensions,
+    ...(error ? { error } : {}),
+  };
+}
+
 export function registerIndexMaintenanceFunctions(
   sdk: ISdk,
   kv: StateKV,
@@ -187,9 +451,22 @@ export function registerIndexMaintenanceFunctions(
 ): IndexMaintenanceController {
   let rebuildPromise: Promise<IndexRebuildResult> | null = null;
   let rebuildStatus: IndexRebuildJobStatus = { state: "idle" };
+  let repairPromise: Promise<IndexRepairResult> | null = null;
+  let repairStatus: IndexRepairJobStatus = { state: "idle" };
 
   const rebuild = (data: { batchSize?: number } = {}): Promise<IndexRebuildResult> => {
     if (rebuildPromise) return rebuildPromise;
+    if (repairPromise) {
+      return Promise.resolve({
+        success: false,
+        bm25Count: options.bm25.size,
+        vectorCount: options.vector?.size ?? 0,
+        failed: 1,
+        failedIds: ["index-repair-running"],
+        dimensions: options.embeddingProvider?.dimensions ?? 0,
+        error: "incremental index repair is already running",
+      });
+    }
 
     const startedAt = new Date().toISOString();
     rebuildStatus = {
@@ -289,6 +566,13 @@ export function registerIndexMaintenanceFunctions(
   const startRebuild = (
     data: { batchSize?: number } = {},
   ): IndexRebuildStartResult => {
+    if (repairPromise) {
+      return {
+        accepted: false,
+        state: "idle",
+        error: "incremental index repair is already running",
+      };
+    }
     const accepted = rebuildPromise === null;
     void rebuild(data).catch((err: unknown) => {
       logger.error("background index rebuild failed", { error: message(err) });
@@ -298,12 +582,91 @@ export function registerIndexMaintenanceFunctions(
 
   const getRebuildStatus = (): IndexRebuildJobStatus => ({ ...rebuildStatus });
 
+  const repair = (data: IndexRepairOptions = {}): Promise<IndexRepairResult> => {
+    if (repairPromise) return repairPromise;
+    if (rebuildPromise) {
+      return Promise.resolve({
+        success: false,
+        scanned: 0,
+        missing: 0,
+        repaired: 0,
+        failed: 1,
+        failedIds: ["index-rebuild-running"],
+        checkpoints: 0,
+        bm25Count: options.bm25.size,
+        vectorCount: options.vector?.size ?? 0,
+        dimensions: options.embeddingProvider?.dimensions ?? 0,
+        error: "atomic index rebuild is already running",
+      });
+    }
+
+    const startedAt = new Date().toISOString();
+    repairStatus = {
+      state: "running",
+      ...(data.batchSize ? { batchSize: data.batchSize } : {}),
+      ...(data.checkpointEvery ? { checkpointEvery: data.checkpointEvery } : {}),
+      startedAt,
+      progress: { scanned: 0, missing: 0, repaired: 0, failed: 0, checkpoints: 0 },
+    };
+    repairPromise = repairMissingIndexes(kv, options, data, (next) => {
+      repairStatus = { ...repairStatus, progress: next };
+    })
+      .then((result) => {
+        repairStatus = {
+          ...repairStatus,
+          state: result.success ? "succeeded" : "failed",
+          finishedAt: new Date().toISOString(),
+          progress: {
+            scanned: result.scanned,
+            missing: result.missing,
+            repaired: result.repaired,
+            failed: result.failed,
+            checkpoints: result.checkpoints,
+          },
+          result,
+          ...(result.error ? { error: result.error } : {}),
+        };
+        return result;
+      })
+      .catch((err: unknown) => {
+        repairStatus = {
+          ...repairStatus,
+          state: "failed",
+          finishedAt: new Date().toISOString(),
+          error: message(err),
+        };
+        throw err;
+      })
+      .finally(() => {
+        repairPromise = null;
+      });
+    return repairPromise;
+  };
+
+  const startRepair = (data: IndexRepairOptions = {}): IndexRepairStartResult => {
+    if (rebuildPromise) {
+      return {
+        accepted: false,
+        state: "idle",
+        error: "atomic index rebuild is already running",
+      };
+    }
+    const accepted = repairPromise === null;
+    void repair(data).catch((err: unknown) => {
+      logger.error("background index repair failed", { error: message(err) });
+    });
+    return { accepted, ...repairStatus };
+  };
+
+  const getRepairStatus = (): IndexRepairJobStatus => ({ ...repairStatus });
+
   sdk.registerFunction("mem::index-status", async () => ({
     success: true,
     ...options.persistence.getStatus(),
     provider: options.embeddingProvider?.name ?? null,
     dimensions: options.embeddingProvider?.dimensions ?? 0,
     rebuild: getRebuildStatus(),
+    repair: getRepairStatus(),
   }));
 
   sdk.registerFunction("mem::index-flush", async () => {
@@ -322,5 +685,18 @@ export function registerIndexMaintenanceFunctions(
     async (data: { batchSize?: number; background?: boolean } = {}) =>
       data.background ? startRebuild(data) : rebuild(data),
   );
-  return { rebuild, startRebuild, getRebuildStatus };
+  sdk.registerFunction(
+    "mem::index-repair",
+    async (
+      data: IndexRepairOptions & { background?: boolean } = {},
+    ) => (data.background ? startRepair(data) : repair(data)),
+  );
+  return {
+    rebuild,
+    startRebuild,
+    getRebuildStatus,
+    repair,
+    startRepair,
+    getRepairStatus,
+  };
 }

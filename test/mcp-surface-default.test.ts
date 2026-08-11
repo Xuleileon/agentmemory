@@ -55,7 +55,7 @@ describe("MCP tool surface default (#553)", () => {
     expect(tool?.inputSchema.properties).toHaveProperty("project");
   });
 
-  it("exposes index status, flush, and atomic rebuild with a positive batch size", () => {
+  it("exposes index status, flush, repair, and atomic rebuild controls", () => {
     const tools = new Map(getAllTools().map((tool) => [tool.name, tool]));
     expect(tools.get("memory_index_status")?.inputSchema.properties).toEqual({});
     expect(tools.get("memory_index_flush")?.inputSchema.properties).toEqual({});
@@ -64,6 +64,14 @@ describe("MCP tool surface default (#553)", () => {
     ).toMatchObject({ type: "number", minimum: 1 });
     expect(tools.get("memory_index_rebuild")?.description).toMatch(/expensive/i);
     expect(tools.get("memory_index_rebuild")?.description).toMatch(/atomic/i);
+    expect(
+      tools.get("memory_index_repair")?.inputSchema.properties.batchSize,
+    ).toMatchObject({ type: "number", minimum: 1 });
+    expect(
+      tools.get("memory_index_repair")?.inputSchema.properties.checkpointEvery,
+    ).toMatchObject({ type: "number", minimum: 1 });
+    expect(tools.get("memory_index_repair")?.description).toMatch(/missing/i);
+    expect(tools.get("memory_index_repair")?.description).toMatch(/resume/i);
   });
 
   it("protects every index maintenance REST trigger with api auth", () => {
@@ -71,6 +79,7 @@ describe("MCP tool surface default (#553)", () => {
     for (const [path, method] of [
       ["/agentmemory/index/status", "GET"],
       ["/agentmemory/index/flush", "POST"],
+      ["/agentmemory/index/repair", "POST"],
       ["/agentmemory/index/rebuild", "POST"],
     ]) {
       const escaped = path.replaceAll("/", "\\/");
@@ -84,11 +93,12 @@ describe("MCP tool surface default (#553)", () => {
     }
   });
 
-  it("maps the three MCP tools only to their index maintenance function IDs", () => {
+  it("maps the MCP tools only to their index maintenance function IDs", () => {
     const source = readFileSync("src/mcp/server.ts", "utf-8");
     for (const tool of [
       "memory_index_status",
       "memory_index_flush",
+      "memory_index_repair",
       "memory_index_rebuild",
     ]) {
       expect(source).toContain(`case "${tool}"`);
@@ -96,6 +106,7 @@ describe("MCP tool surface default (#553)", () => {
     for (const functionId of [
       "mem::index-status",
       "mem::index-flush",
+      "mem::index-repair",
       "mem::index-rebuild",
     ]) {
       expect(source).toContain(`"${functionId}"`);

@@ -42,6 +42,10 @@ export class VectorIndex {
     this.vectors.set(obsId, { embedding, sessionId });
   }
 
+  has(obsId: string): boolean {
+    return this.vectors.has(obsId);
+  }
+
   remove(obsId: string): void {
     this.vectors.delete(obsId);
   }

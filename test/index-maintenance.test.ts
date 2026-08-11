@@ -357,4 +357,164 @@ describe("atomic index maintenance", () => {
     expect(result.vectorCount).toBe(11);
     expect(embedBatch.mock.calls.map(([texts]) => texts.length)).toEqual([8, 3]);
   });
+
+  it("repairs only missing entries and is idempotent on the next run", async () => {
+    const embedBatch = vi.fn(async (texts: string[]) =>
+      texts.map(() => new Float32Array([1, 0, 0])),
+    );
+    const activeBm25 = new SearchIndex();
+    const existingMemory = memory("mem_existing");
+    const missingObservation = observation("obs_missing", "sess_1");
+    activeBm25.add({
+      ...missingObservation,
+      id: existingMemory.id,
+      sessionId: "memory",
+      title: existingMemory.title,
+      narrative: existingMemory.content,
+    });
+    activeBm25.add(missingObservation);
+    const activeVector = new VectorIndex();
+    activeVector.add(existingMemory.id, "memory", new Float32Array([1, 0, 0]));
+    const save = vi.fn(async () => {});
+    const sdk = mockSdk();
+    registerIndexMaintenanceFunctions(
+      sdk as never,
+      mockKV({
+        memories: [existingMemory],
+        sessions: [session("sess_1")],
+        observations: { sess_1: [missingObservation] },
+      }) as never,
+      {
+        bm25: activeBm25,
+        vector: activeVector,
+        embeddingProvider: { ...provider, embedBatch },
+        persistence: {
+          save,
+          getStatus: () => ({ dirty: false }),
+        },
+      },
+    );
+
+    const first = await sdk.trigger("mem::index-repair", {
+      batchSize: 8,
+      checkpointEvery: 100,
+    }) as Record<string, number | boolean>;
+    expect(first).toMatchObject({
+      success: true,
+      scanned: 2,
+      missing: 1,
+      repaired: 1,
+      failed: 0,
+      vectorCount: 2,
+    });
+    expect(embedBatch).toHaveBeenCalledTimes(1);
+    expect(embedBatch.mock.calls[0][0]).toEqual([
+      `${missingObservation.title} ${missingObservation.narrative}`,
+    ]);
+    expect(save).toHaveBeenCalledTimes(1);
+
+    embedBatch.mockClear();
+    save.mockClear();
+    const second = await sdk.trigger("mem::index-repair", {
+      batchSize: 8,
+      checkpointEvery: 100,
+    }) as Record<string, number | boolean>;
+    expect(second).toMatchObject({
+      success: true,
+      scanned: 2,
+      missing: 0,
+      repaired: 0,
+      failed: 0,
+      vectorCount: 2,
+    });
+    expect(embedBatch).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("checkpoints a large missing-vector repair and exposes progress", async () => {
+    const embedBatch = vi.fn(async (texts: string[]) =>
+      texts.map(() => new Float32Array([1, 0, 0])),
+    );
+    const save = vi.fn(async () => {});
+    const sdk = mockSdk();
+    registerIndexMaintenanceFunctions(
+      sdk as never,
+      mockKV({
+        memories: [memory("mem_1"), memory("mem_2"), memory("mem_3")],
+      }) as never,
+      {
+        bm25: new SearchIndex(),
+        vector: new VectorIndex(),
+        embeddingProvider: { ...provider, embedBatch },
+        persistence: {
+          save,
+          getStatus: () => ({ dirty: false }),
+        },
+      },
+    );
+
+    const result = await sdk.trigger("mem::index-repair", {
+      batchSize: 1,
+      checkpointEvery: 2,
+    }) as Record<string, number | boolean>;
+    expect(result).toMatchObject({
+      success: true,
+      scanned: 3,
+      missing: 3,
+      repaired: 3,
+      failed: 0,
+      checkpoints: 2,
+      bm25Count: 3,
+      vectorCount: 3,
+    });
+    expect(embedBatch).toHaveBeenCalledTimes(3);
+    expect(save).toHaveBeenCalledTimes(2);
+
+    const status = await sdk.trigger("mem::index-status") as Record<string, any>;
+    expect(status.repair).toMatchObject({
+      state: "succeeded",
+      result: { success: true, repaired: 3, checkpoints: 2 },
+    });
+  });
+
+  it("skips a failed embedding item and continues repairing later records", async () => {
+    let calls = 0;
+    const embedBatch = vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error("one bad record");
+      return [new Float32Array([1, 0, 0])];
+    });
+    const save = vi.fn(async () => {});
+    const sdk = mockSdk();
+    registerIndexMaintenanceFunctions(
+      sdk as never,
+      mockKV({ memories: [memory("mem_bad"), memory("mem_good")] }) as never,
+      {
+        bm25: new SearchIndex(),
+        vector: new VectorIndex(),
+        embeddingProvider: { ...provider, embedBatch },
+        persistence: {
+          save,
+          getStatus: () => ({ dirty: false }),
+        },
+      },
+    );
+
+    const result = await sdk.trigger("mem::index-repair", {
+      batchSize: 1,
+      checkpointEvery: 10,
+    }) as Record<string, any>;
+    expect(result).toMatchObject({
+      success: false,
+      scanned: 2,
+      missing: 2,
+      repaired: 1,
+      failed: 1,
+      failedIds: ["mem_bad"],
+      vectorCount: 1,
+      checkpoints: 1,
+    });
+    expect(embedBatch).toHaveBeenCalledTimes(2);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
 });

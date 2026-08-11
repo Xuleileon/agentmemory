@@ -92,6 +92,26 @@ describe("session API pagination", () => {
     });
   });
 
+  it("starts resumable index repairs as background jobs", async () => {
+    const sdk = mockSdk();
+    const startRepair = vi.fn(async () => ({ accepted: true, state: "running" }));
+    sdk.registerFunction("mem::index-repair", startRepair);
+    registerApiTriggers(sdk as never, mockKV([]) as never);
+
+    const response = await sdk.functions.get("api::index-repair")!({
+      body: { batchSize: 64, checkpointEvery: 10000 },
+      headers: {},
+    }) as { status_code: number; body: Record<string, unknown> };
+
+    expect(response.status_code).toBe(202);
+    expect(response.body).toMatchObject({ accepted: true, state: "running" });
+    expect(startRepair).toHaveBeenCalledWith({
+      batchSize: 64,
+      checkpointEvery: 10000,
+      background: true,
+    });
+  });
+
   it("bounds default and explicit replay responses", async () => {
     const sessions = Array.from({ length: 600 }, (_, index) => session(index));
     const kv = mockKV(sessions);
