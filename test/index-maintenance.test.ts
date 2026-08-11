@@ -332,4 +332,29 @@ describe("atomic index maintenance", () => {
     expect(embedBatch).toHaveBeenCalledTimes(2);
     expect(embedBatch.mock.calls.every(([texts]) => texts.length === 1)).toBe(true);
   });
+
+  it("fills embedding batches across session read chunks", async () => {
+    const embedBatch = vi.fn(async (texts: string[]) =>
+      texts.map(() => new Float32Array([1, 0, 0])),
+    );
+    const sessions = Array.from({ length: 11 }, (_, index) =>
+      session(`sess_${index}`),
+    );
+    const observations = Object.fromEntries(
+      sessions.map((item, index) => [
+        item.id,
+        [observation(`obs_${index}`, item.id)],
+      ]),
+    );
+
+    const result = await buildReplacementIndexes(
+      mockKV({ sessions, observations }) as never,
+      { ...provider, embedBatch },
+      { batchSize: 8 },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.vectorCount).toBe(11);
+    expect(embedBatch.mock.calls.map(([texts]) => texts.length)).toEqual([8, 3]);
+  });
 });

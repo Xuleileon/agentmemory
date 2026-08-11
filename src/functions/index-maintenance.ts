@@ -63,6 +63,7 @@ export interface IndexRebuildStartResult extends IndexRebuildJobStatus {
 }
 
 const SESSION_READ_BATCH = 10;
+const DEFAULT_EMBED_BATCH = 32;
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -122,6 +123,22 @@ export async function buildReplacementIndexes(
     logger.warn("index rebuild: failed to load sessions", { error: message(err) });
   }
 
+  const embedBatchSize =
+    Number.isInteger(options.batchSize) && (options.batchSize as number) > 0
+      ? (options.batchSize as number)
+      : DEFAULT_EMBED_BATCH;
+  const pendingObservations: CompressedObservation[] = [];
+  const indexObservationBatch = async (count: number): Promise<void> => {
+    const batch = pendingObservations.splice(0, count);
+    const result = await indexRecordsInto(batch, [], {
+      bm25,
+      vector,
+      embeddingProvider,
+      batchSize: embedBatchSize,
+    });
+    for (const id of result.failedIds) failedIds.add(id);
+  };
+
   for (let offset = 0; offset < sessions.length; offset += SESSION_READ_BATCH) {
     const chunk = sessions.slice(offset, offset + SESSION_READ_BATCH);
     const observations = await Promise.all(
@@ -138,13 +155,16 @@ export async function buildReplacementIndexes(
         }
       }),
     );
-    const observationResult = await indexRecordsInto(observations.flat(), [], {
-      bm25,
-      vector,
-      embeddingProvider,
-      batchSize: options.batchSize,
-    });
-    for (const id of observationResult.failedIds) failedIds.add(id);
+    pendingObservations.push(
+      ...observations.flat().filter((item) => item.title && item.narrative),
+    );
+    while (pendingObservations.length >= embedBatchSize) {
+      await indexObservationBatch(embedBatchSize);
+    }
+  }
+
+  if (pendingObservations.length > 0) {
+    await indexObservationBatch(pendingObservations.length);
   }
 
   const failures = Array.from(failedIds);
