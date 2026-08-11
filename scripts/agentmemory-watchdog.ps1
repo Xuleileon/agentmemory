@@ -17,7 +17,9 @@ $logRoot = Join-Path $runtimeRoot 'logs'
 $pidPath = Join-Path $runtimeRoot 'iii.pid'
 $lockPath = Join-Path $runtimeRoot 'watchdog.lock'
 $healthUrl = $HealthUrl
-$workerCommandFragment = (Join-Path $repoRoot 'dist\index.mjs').Replace('\', '/')
+$workerPath = Join-Path $repoRoot 'dist\index.mjs'
+$workerCommandFragment = $workerPath.Replace('\', '/')
+$nodePath = (Get-Command node.exe -ErrorAction Stop).Source
 
 if (-not [System.IO.Path]::IsPathFullyQualified($repoRoot) -or
     -not [System.IO.Path]::IsPathFullyQualified($iiiPath) -or
@@ -32,6 +34,9 @@ if (-not (Test-Path -LiteralPath $iiiPath -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
   throw "iii config not found: $configPath"
+}
+if (-not (Test-Path -LiteralPath $workerPath -PathType Leaf)) {
+  throw "agentmemory worker not found: $workerPath"
 }
 
 New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
@@ -115,6 +120,8 @@ function Start-ManagedStack {
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $stdoutPath = Join-Path $logRoot "engine-$stamp.stdout.log"
   $stderrPath = Join-Path $logRoot "engine-$stamp.stderr.log"
+  $workerStdoutPath = Join-Path $logRoot "worker-$stamp.stdout.log"
+  $workerStderrPath = Join-Path $logRoot "worker-$stamp.stderr.log"
   $startArgs = @{
     FilePath = $iiiPath
     ArgumentList = @('--config', $configPath)
@@ -130,8 +137,24 @@ function Start-ManagedStack {
   $env:RUST_LOG = 'warn'
   $process = Start-Process @startArgs
 
+  # Production supervision owns the worker explicitly. Relying on iii-exec
+  # alone leaves the REST engine alive with no AgentMemory routes when its
+  # child launch is missed; that produces an endless healthy-engine/404 loop.
+  # The SDK reconnects while iii finishes starting, and both PIDs are then
+  # covered by the same structural health check above.
+  $workerArgs = @{
+    FilePath = $nodePath
+    ArgumentList = @($workerPath)
+    WorkingDirectory = $repoRoot
+    WindowStyle = 'Hidden'
+    RedirectStandardOutput = $workerStdoutPath
+    RedirectStandardError = $workerStderrPath
+    PassThru = $true
+  }
+  $workerProcess = Start-Process @workerArgs
+
   Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding ascii
-  Write-WatchdogLog "started iii pid=$($process.Id) stdout=$stdoutPath stderr=$stderrPath"
+  Write-WatchdogLog "started iii pid=$($process.Id) worker pid=$($workerProcess.Id) engine_stdout=$stdoutPath engine_stderr=$stderrPath worker_stdout=$workerStdoutPath worker_stderr=$workerStderrPath"
 }
 
 try {
