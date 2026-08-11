@@ -1,6 +1,7 @@
 param(
   [int]$ProbeIntervalSeconds = 5,
-  [int]$FailureThreshold = 3
+  [int]$FailureThreshold = 3,
+  [string]$HealthUrl = 'http://127.0.0.1:3111/agentmemory/livez'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,13 +15,16 @@ $configPath = Join-Path $runtimeRoot 'data\iii-config.yaml'
 $logRoot = Join-Path $runtimeRoot 'logs'
 $pidPath = Join-Path $runtimeRoot 'iii.pid'
 $lockPath = Join-Path $runtimeRoot 'watchdog.lock'
-$healthUrl = 'http://127.0.0.1:3111/agentmemory/livez'
+$healthUrl = $HealthUrl
 $workerCommandFragment = (Join-Path $repoRoot 'dist\index.mjs').Replace('\', '/')
 
 if (-not [System.IO.Path]::IsPathFullyQualified($repoRoot) -or
     -not [System.IO.Path]::IsPathFullyQualified($iiiPath) -or
     -not [System.IO.Path]::IsPathFullyQualified($configPath)) {
   throw 'watchdog paths must be absolute'
+}
+if ($ProbeIntervalSeconds -lt 1 -or $FailureThreshold -lt 1) {
+  throw 'watchdog intervals and thresholds must be positive integers'
 }
 if (-not (Test-Path -LiteralPath $iiiPath -PathType Leaf)) {
   throw "iii binary not found: $iiiPath"
@@ -47,7 +51,11 @@ try {
 
 function Write-WatchdogLog([string]$Message) {
   $line = '{0:o} {1}' -f (Get-Date), $Message
-  Add-Content -LiteralPath (Join-Path $logRoot 'watchdog.log') -Value $line -Encoding utf8
+  try {
+    Add-Content -LiteralPath (Join-Path $logRoot 'watchdog.log') -Value $line -Encoding utf8
+  } catch {
+    # A transient logging failure must never take down the supervisor.
+  }
 }
 
 function Get-ManagedEngines {
@@ -71,9 +79,17 @@ function Get-ManagedWorkers {
 function Test-AgentMemoryLive {
   try {
     $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 3 -UseBasicParsing
-    return $response.StatusCode -eq 200
+    return [pscustomobject]@{ Kind = 'live'; Detail = "http $($response.StatusCode)" }
   } catch {
-    return $false
+    $statusCode = $null
+    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+    if ($statusCode -eq 404) {
+      return [pscustomobject]@{ Kind = 'missing-route'; Detail = 'http 404' }
+    }
+
+    $message = $_.Exception.Message
+    $kind = if ($message -match 'timed out|timeout|canceled') { 'timeout' } else { 'unreachable' }
+    return [pscustomobject]@{ Kind = $kind; Detail = $message }
   }
 }
 
@@ -120,27 +136,47 @@ function Start-ManagedStack {
 try {
   $failures = 0
   while ($true) {
-    $engines = @(Get-ManagedEngines)
-    $workers = @(Get-ManagedWorkers)
-    $live = Test-AgentMemoryLive
+    try {
+      $engines = @(Get-ManagedEngines)
+      $workers = @(Get-ManagedWorkers)
+      $probe = Test-AgentMemoryLive
 
-    if ($engines.Count -eq 1 -and $workers.Count -eq 1 -and $live) {
-      $failures = 0
-    } else {
-      $failures++
-      Write-WatchdogLog "probe failed count=$failures engines=$($engines.Count) workers=$($workers.Count) live=$live"
-    }
+      $structureMissing = $engines.Count -ne 1 -or $workers.Count -ne 1
+      $routeMissing = $probe.Kind -eq 'missing-route'
+      if ($structureMissing -or $routeMissing) {
+        $failures++
+        Write-WatchdogLog "probe failed count=$failures engines=$($engines.Count) workers=$($workers.Count) probe=$($probe.Kind) detail=$($probe.Detail)"
+      } else {
+        $failures = 0
+        if ($probe.Kind -ne 'live') {
+          # A saturated but present worker can make /livez exceed 3 seconds.
+          # Killing it turns load shedding into an outage, so timeouts and
+          # connection stalls are diagnostic-only while both processes exist.
+          Write-WatchdogLog "probe degraded engines=1 workers=1 probe=$($probe.Kind) detail=$($probe.Detail)"
+        }
+      }
 
-    if ($engines.Count -eq 0 -or $failures -ge $FailureThreshold) {
-      Write-WatchdogLog "restarting managed stack engines=$($engines.Count) workers=$($workers.Count) live=$live"
-      Stop-ManagedStack
-      Start-ManagedStack
-      $failures = 0
+      if ($engines.Count -eq 0 -or $failures -ge $FailureThreshold) {
+        Write-WatchdogLog "restarting managed stack engines=$($engines.Count) workers=$($workers.Count) probe=$($probe.Kind)"
+        try {
+          Stop-ManagedStack
+          Start-ManagedStack
+          Write-WatchdogLog 'restart completed'
+        } catch {
+          # A process can linger briefly after Stop-Process. Keep the task
+          # alive and retry from freshly enumerated PIDs on the next cycle.
+          Write-WatchdogLog "restart failed; will retry: $($_.Exception.Message)"
+        }
+        $failures = 0
 
-      # Give iii-exec time to register the worker before probes count against
-      # the new process. A real startup failure is retried on the next cycle.
-      Start-Sleep -Seconds 15
-    } else {
+        # A large persisted index can take over 20 seconds to register every
+        # route. Process presence protects this grace window from false kills.
+        Start-Sleep -Seconds 30
+      } else {
+        Start-Sleep -Seconds $ProbeIntervalSeconds
+      }
+    } catch {
+      Write-WatchdogLog "supervision loop error; continuing: $($_.Exception.Message)"
       Start-Sleep -Seconds $ProbeIntervalSeconds
     }
   }
