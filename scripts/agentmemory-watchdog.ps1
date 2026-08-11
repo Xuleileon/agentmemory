@@ -1,6 +1,7 @@
 param(
   [int]$ProbeIntervalSeconds = 5,
   [int]$FailureThreshold = 3,
+  [int]$StartupGraceSeconds = 180,
   [string]$HealthUrl = 'http://127.0.0.1:3111/agentmemory/livez'
 )
 
@@ -23,8 +24,8 @@ if (-not [System.IO.Path]::IsPathFullyQualified($repoRoot) -or
     -not [System.IO.Path]::IsPathFullyQualified($configPath)) {
   throw 'watchdog paths must be absolute'
 }
-if ($ProbeIntervalSeconds -lt 1 -or $FailureThreshold -lt 1) {
-  throw 'watchdog intervals and thresholds must be positive integers'
+if ($ProbeIntervalSeconds -lt 1 -or $FailureThreshold -lt 1 -or $StartupGraceSeconds -lt 1) {
+  throw 'watchdog intervals, thresholds, and startup grace must be positive integers'
 }
 if (-not (Test-Path -LiteralPath $iiiPath -PathType Leaf)) {
   throw "iii binary not found: $iiiPath"
@@ -143,12 +144,23 @@ try {
 
       $structureMissing = $engines.Count -ne 1 -or $workers.Count -ne 1
       $routeMissing = $probe.Kind -eq 'missing-route'
-      if ($structureMissing -or $routeMissing) {
+      $workerAgeSeconds = if ($workers.Count -eq 1) {
+        [Math]::Max(0, ((Get-Date) - [datetime]$workers[0].CreationDate).TotalSeconds)
+      } else {
+        [double]::PositiveInfinity
+      }
+      $routeStillStarting = $routeMissing -and
+        -not $structureMissing -and
+        $workerAgeSeconds -lt $StartupGraceSeconds
+      if ($structureMissing -or ($routeMissing -and -not $routeStillStarting)) {
         $failures++
         Write-WatchdogLog "probe failed count=$failures engines=$($engines.Count) workers=$($workers.Count) probe=$($probe.Kind) detail=$($probe.Detail)"
       } else {
         $failures = 0
-        if ($probe.Kind -ne 'live') {
+        if ($routeStillStarting) {
+          $age = [Math]::Round($workerAgeSeconds, 1)
+          Write-WatchdogLog "probe starting engines=1 workers=1 age=${age}s grace=${StartupGraceSeconds}s probe=missing-route"
+        } elseif ($probe.Kind -ne 'live') {
           # A saturated but present worker can make /livez exceed 3 seconds.
           # Killing it turns load shedding into an outage, so timeouts and
           # connection stalls are diagnostic-only while both processes exist.
@@ -169,9 +181,7 @@ try {
         }
         $failures = 0
 
-        # A large persisted index can take over 20 seconds to register every
-        # route. Process presence protects this grace window from false kills.
-        Start-Sleep -Seconds 30
+        Start-Sleep -Seconds $ProbeIntervalSeconds
       } else {
         Start-Sleep -Seconds $ProbeIntervalSeconds
       }
