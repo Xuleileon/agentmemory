@@ -227,6 +227,152 @@ function getRebuildEmbedBatchSize(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
 }
 
+export interface IndexTargets {
+  bm25: SearchIndex
+  vector: VectorIndex | null
+  embeddingProvider: EmbeddingProvider | null
+}
+
+export interface IndexRecordsResult {
+  indexed: number
+  vectorized: number
+  failedIds: string[]
+}
+
+type IndexEmbedJob = {
+  id: string
+  sessionId: string
+  text: string
+  context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+}
+
+// Explicit-target variant used by atomic rebuilds. Building into temporary
+// indexes keeps the active search path untouched until every embedding has
+// succeeded. Import/live-write callers continue to use indexRecords(), which
+// delegates here with the active singleton targets.
+export async function indexRecordsInto(
+  observations: CompressedObservation[],
+  memories: Memory[],
+  targets: IndexTargets,
+): Promise<IndexRecordsResult> {
+  const batchSize = getRebuildEmbedBatchSize()
+  const vectorEnabled = Boolean(targets.vector && targets.embeddingProvider)
+  const failedIds = new Set<string>()
+  const pending: IndexEmbedJob[] = []
+  let indexed = 0
+  let vectorized = 0
+
+  const flush = async (): Promise<void> => {
+    if (pending.length === 0) return
+    const jobs = pending.splice(0, pending.length)
+    const vector = targets.vector
+    const provider = targets.embeddingProvider
+    if (!vector || !provider) return
+
+    let embeddings: Float32Array[]
+    try {
+      embeddings = await provider.embedBatch(
+        jobs.map((job) => clipEmbedInput(job.text)),
+      )
+    } catch (err) {
+      for (const job of jobs) failedIds.add(job.id)
+      logger.warn("indexRecordsInto: embedding batch failed", {
+        batchSize: jobs.length,
+        provider: provider.name,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
+
+    if (embeddings.length !== jobs.length) {
+      for (const job of jobs) failedIds.add(job.id)
+      logger.warn("indexRecordsInto: embedding batch returned wrong length", {
+        batchSize: jobs.length,
+        returned: embeddings.length,
+        provider: provider.name,
+      })
+      return
+    }
+
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i]
+      const embedding = embeddings[i]
+      if (embedding.length !== provider.dimensions) {
+        failedIds.add(job.id)
+        logger.warn("indexRecordsInto: embedding dimension mismatch", {
+          id: job.context.logId,
+          provider: provider.name,
+          expected: provider.dimensions,
+          received: embedding.length,
+        })
+        continue
+      }
+      try {
+        vector.add(job.id, job.sessionId, embedding)
+        vectorized++
+      } catch (err) {
+        failedIds.add(job.id)
+        logger.warn("indexRecordsInto: vector index write failed", {
+          id: job.context.logId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+  }
+
+  const enqueue = async (job: IndexEmbedJob): Promise<void> => {
+    if (!vectorEnabled) return
+    pending.push(job)
+    if (pending.length >= batchSize) await flush()
+  }
+
+  for (const memory of memories) {
+    if (memory.isLatest === false) continue
+    if (!memory.title || !memory.content) continue
+    try {
+      targets.bm25.add(memoryToObservation(memory))
+      indexed++
+    } catch (err) {
+      failedIds.add(memory.id)
+      logger.warn("indexRecordsInto: BM25 memory write failed", {
+        id: memory.id,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      continue
+    }
+    await enqueue({
+      id: memory.id,
+      sessionId: memory.sessionIds?.[0] ?? "memory",
+      text: memory.title + " " + memory.content,
+      context: { kind: "memory", logId: memory.id },
+    })
+  }
+
+  for (const obs of observations) {
+    if (!obs.title || !obs.narrative) continue
+    try {
+      targets.bm25.add(obs)
+      indexed++
+    } catch (err) {
+      failedIds.add(obs.id)
+      logger.warn("indexRecordsInto: BM25 observation write failed", {
+        id: obs.id,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      continue
+    }
+    await enqueue({
+      id: obs.id,
+      sessionId: obs.sessionId,
+      text: obs.title + " " + obs.narrative,
+      context: { kind: "observation", logId: obs.id },
+    })
+  }
+
+  await flush()
+  return { indexed, vectorized, failedIds: Array.from(failedIds) }
+}
+
 // Shared BM25 + batched-vector indexing for a set of records. The full
 // rebuild and every import path (export-import, jsonl replay) funnel
 // through this so they index identically and none can silently skip the
@@ -238,53 +384,12 @@ export async function indexRecords(
   observations: CompressedObservation[],
   memories: Memory[],
 ): Promise<number> {
-  const idx = getSearchIndex()
-  const vectorEnabled = Boolean(vectorIndex && currentEmbeddingProvider)
-  const batchSize = getRebuildEmbedBatchSize()
-  type EmbedJob = {
-    id: string
-    sessionId: string
-    text: string
-    context: { kind: "memory" | "observation" | "synthetic"; logId: string }
-  }
-  const pending: EmbedJob[] = []
-  const flush = async (): Promise<void> => {
-    if (pending.length === 0) return
-    await vectorIndexAddBatchGuarded(pending)
-    pending.length = 0
-  }
-  const enqueue = async (job: EmbedJob): Promise<void> => {
-    if (!vectorEnabled) return
-    pending.push(job)
-    if (pending.length >= batchSize) await flush()
-  }
-
-  let count = 0
-  for (const memory of memories) {
-    if (memory.isLatest === false) continue
-    if (!memory.title || !memory.content) continue
-    idx.add(memoryToObservation(memory))
-    await enqueue({
-      id: memory.id,
-      sessionId: memory.sessionIds?.[0] ?? 'memory',
-      text: memory.title + ' ' + memory.content,
-      context: { kind: "memory", logId: memory.id },
-    })
-    count++
-  }
-  for (const obs of observations) {
-    if (!obs.title || !obs.narrative) continue
-    idx.add(obs)
-    await enqueue({
-      id: obs.id,
-      sessionId: obs.sessionId,
-      text: obs.title + ' ' + obs.narrative,
-      context: { kind: "observation", logId: obs.id },
-    })
-    count++
-  }
-  await flush()
-  return count
+  const result = await indexRecordsInto(observations, memories, {
+    bm25: getSearchIndex(),
+    vector: vectorIndex,
+    embeddingProvider: currentEmbeddingProvider,
+  })
+  return result.indexed
 }
 
 export async function rebuildIndex(kv: StateKV): Promise<number> {
@@ -340,7 +445,11 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   return indexed
 }
 
-export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
+export function registerSearchFunction(
+  sdk: ISdk,
+  kv: StateKV,
+  rebuildSearchIndex: () => Promise<number> = () => rebuildIndex(kv),
+): void {
   sdk.registerFunction(
     'mem::search',
     async (data: {
@@ -421,7 +530,7 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
         // Share one rebuild across concurrent cold-start queries so they
         // don't each walk the whole corpus and saturate the pool.
         if (!rebuildPromise) {
-          rebuildPromise = rebuildIndex(kv)
+          rebuildPromise = rebuildSearchIndex()
             .then((count) => {
               logger.info('Search index rebuilt', { entries: count })
               return count

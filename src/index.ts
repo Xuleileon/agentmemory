@@ -34,12 +34,12 @@ import { registerDiskSizeManager } from "./functions/disk-size-manager.js";
 import { registerCompressFunction } from "./functions/compress.js";
 import {
   registerSearchFunction,
-  rebuildIndex,
   getSearchIndex,
   setVectorIndex,
   setEmbeddingProvider,
   setIndexPersistence,
 } from "./functions/search.js";
+import { registerIndexMaintenanceFunctions } from "./functions/index-maintenance.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
@@ -247,7 +247,6 @@ async function main() {
   }
   registerDiskSizeManager(sdk, kv);
   registerCompressFunction(sdk, kv, provider, metricsStore);
-  registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
   registerMigrateFunction(sdk, kv);
@@ -403,6 +402,16 @@ async function main() {
   // lost across a hard process exit and the persisted snapshot
   // restores the deleted entry at next boot.
   setIndexPersistence(indexPersistence);
+  const indexMaintenance = registerIndexMaintenanceFunctions(sdk, kv, {
+    bm25: bm25Index,
+    vector: vectorIndex,
+    embeddingProvider,
+    persistence: indexPersistence,
+  });
+  registerSearchFunction(sdk, kv, async () => {
+    const result = await indexMaintenance.rebuild();
+    return result.success ? result.bm25Count : 0;
+  });
 
   const loaded = await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted index:`, err);
@@ -471,19 +480,23 @@ async function main() {
   const needsRebuild = bm25Index.size === 0;
 
   if (needsRebuild) {
-    // Fire-and-forget. rebuildIndex iterates every observation across
-    // every session and AWAITS an embedding-provider call per record.
-    // On a large corpus + rate-limited embedding endpoint that can
-    // take HOURS; awaiting it here blocks every subsequent boot step
-    // (including startViewerServer below, leaving the viewer port
-    // unbound for the duration). The index lazily fills in over time
-    // and search degrades gracefully — partial coverage > no viewer
-    // for hours. Errors still surface via the inner .catch.
-    void rebuildIndex(kv)
-      .then((indexCount) => {
-        if (indexCount > 0) {
-          bootLog(`Search index rebuilt: ${indexCount} entries`);
-          indexPersistence.scheduleSave();
+    // Build off-path so a provider error cannot leave a partial snapshot
+    // that suppresses the next startup rebuild. This remains fire-and-forget
+    // because a large local embedding corpus can take hours.
+    void indexMaintenance
+      .rebuild()
+      .then((result) => {
+        if (result.success) {
+          bootLog(
+            `Search indexes rebuilt: ${result.bm25Count} BM25, ` +
+              `${result.vectorCount} vectors`,
+          );
+        } else {
+          console.warn(
+            `[agentmemory] Search index rebuild did not swap: ` +
+              `${result.failed} failures` +
+              (result.error ? ` (${result.error})` : ""),
+          );
         }
       })
       .catch((err) => {
