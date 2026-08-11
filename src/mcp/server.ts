@@ -685,6 +685,17 @@ export function registerMcpEndpoints(
                 body: { error: "checkpointEvery must be a positive integer" },
               };
             }
+            if (
+              name === "memory_index_repair" &&
+              args.maxDurationMs !== undefined &&
+              (!Number.isInteger(args.maxDurationMs) ||
+                (args.maxDurationMs as number) < 1)
+            ) {
+              return {
+                status_code: 400,
+                body: { error: "maxDurationMs must be a positive integer" },
+              };
+            }
             const functionId =
               name === "memory_index_status"
                 ? "mem::index-status"
@@ -702,6 +713,7 @@ export function registerMcpEndpoints(
                       ...(name === "memory_index_repair"
                         ? {
                             checkpointEvery: args.checkpointEvery as number | undefined,
+                            maxDurationMs: args.maxDurationMs as number | undefined,
                           }
                         : {}),
                       background: true,

@@ -997,6 +997,12 @@ export const INDEX_MAINTENANCE_TOOLS: McpToolDef[] = [
           description: "Persist after this many repaired index entries (default 25000)",
           minimum: 1,
         },
+        maxDurationMs: {
+          type: "number",
+          description:
+            "Stop after this many milliseconds, checkpoint completed work, and report failure",
+          minimum: 1,
+        },
       },
     },
   },

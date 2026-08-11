@@ -517,4 +517,48 @@ describe("atomic index maintenance", () => {
     expect(embedBatch).toHaveBeenCalledTimes(2);
     expect(save).toHaveBeenCalledTimes(1);
   });
+
+  it("checkpoints completed work and fails when the repair time budget expires", async () => {
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const embedBatch = vi.fn(async () => {
+      now = 6;
+      return [new Float32Array([1, 0, 0])];
+    });
+    const save = vi.fn(async () => {});
+    const sdk = mockSdk();
+    registerIndexMaintenanceFunctions(
+      sdk as never,
+      mockKV({ memories: [memory("mem_1"), memory("mem_2")] }) as never,
+      {
+        bm25: new SearchIndex(),
+        vector: new VectorIndex(),
+        embeddingProvider: { ...provider, embedBatch },
+        persistence: {
+          save,
+          getStatus: () => ({ dirty: false }),
+        },
+      },
+    );
+
+    const result = await sdk.trigger("mem::index-repair", {
+      batchSize: 1,
+      checkpointEvery: 100,
+      maxDurationMs: 5,
+    }) as Record<string, any>;
+
+    expect(result).toMatchObject({
+      success: false,
+      scanned: 1,
+      repaired: 1,
+      failed: 1,
+      failedIds: ["repair-time-budget-exceeded"],
+      vectorCount: 1,
+      checkpoints: 1,
+      error: "index repair exceeded 5ms time budget",
+    });
+    expect(embedBatch).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledTimes(1);
+    dateNow.mockRestore();
+  });
 });

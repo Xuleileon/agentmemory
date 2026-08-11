@@ -69,6 +69,7 @@ export interface IndexRebuildStartResult extends IndexRebuildJobStatus {
 export interface IndexRepairOptions {
   batchSize?: number;
   checkpointEvery?: number;
+  maxDurationMs?: number;
 }
 
 export interface IndexRepairResult {
@@ -97,6 +98,7 @@ export interface IndexRepairJobStatus {
   state: IndexRebuildState;
   batchSize?: number;
   checkpointEvery?: number;
+  maxDurationMs?: number;
   startedAt?: string;
   finishedAt?: string;
   progress?: IndexRepairProgress;
@@ -260,6 +262,14 @@ export async function repairMissingIndexes(
     (controls.checkpointEvery as number) > 0
       ? (controls.checkpointEvery as number)
       : DEFAULT_REPAIR_CHECKPOINT_EVERY;
+  const maxDurationMs =
+    Number.isInteger(controls.maxDurationMs) &&
+    (controls.maxDurationMs as number) > 0
+      ? (controls.maxDurationMs as number)
+      : undefined;
+  const startedAtMs = Date.now();
+  const timeBudgetExceeded = (): boolean =>
+    maxDurationMs !== undefined && Date.now() - startedAtMs >= maxDurationMs;
   const failedIds = new Set<string>();
   const pendingMemories: Memory[] = [];
   const pendingObservations: CompressedObservation[] = [];
@@ -269,6 +279,8 @@ export async function repairMissingIndexes(
   let checkpoints = 0;
   let repairedSinceCheckpoint = 0;
   let dirtySinceCheckpoint = false;
+  let timedOut = false;
+  let checkpointFailed = false;
 
   const progress = (): IndexRepairProgress => ({
     scanned,
@@ -394,7 +406,13 @@ export async function repairMissingIndexes(
       failedIds.add(KV.memories);
       logger.warn("index repair: failed to load memories", { error: message(err) });
     }
-    for (const memory of memories) await inspectMemory(memory);
+    for (const memory of memories) {
+      if (timeBudgetExceeded()) {
+        timedOut = true;
+        break;
+      }
+      await inspectMemory(memory);
+    }
 
     let sessions: Session[] = [];
     try {
@@ -403,7 +421,15 @@ export async function repairMissingIndexes(
       failedIds.add(KV.sessions);
       logger.warn("index repair: failed to load sessions", { error: message(err) });
     }
-    for (let offset = 0; offset < sessions.length; offset += SESSION_READ_BATCH) {
+    for (
+      let offset = 0;
+      !timedOut && offset < sessions.length;
+      offset += SESSION_READ_BATCH
+    ) {
+      if (timeBudgetExceeded()) {
+        timedOut = true;
+        break;
+      }
       const chunk = sessions.slice(offset, offset + SESSION_READ_BATCH);
       const observations = await Promise.all(
         chunk.map(async (session) => {
@@ -419,12 +445,23 @@ export async function repairMissingIndexes(
           }
         }),
       );
-      for (const obs of observations.flat()) await inspectObservation(obs);
+      for (const obs of observations.flat()) {
+        if (timeBudgetExceeded()) {
+          timedOut = true;
+          break;
+        }
+        await inspectObservation(obs);
+      }
       publish();
     }
     await flushVectors();
     await checkpoint();
+    if (timedOut && maxDurationMs !== undefined) {
+      error = `index repair exceeded ${maxDurationMs}ms time budget`;
+      failedIds.add("repair-time-budget-exceeded");
+    }
   } catch (err) {
+    checkpointFailed = true;
     error = `index repair checkpoint failed: ${message(err)}`;
   }
 
@@ -434,8 +471,8 @@ export async function repairMissingIndexes(
     scanned,
     missing,
     repaired,
-    failed: failures.length + (error ? 1 : 0),
-    failedIds: error ? [...failures, "index-checkpoint"] : failures,
+    failed: failures.length + (checkpointFailed ? 1 : 0),
+    failedIds: checkpointFailed ? [...failures, "index-checkpoint"] : failures,
     checkpoints,
     bm25Count: options.bm25.size,
     vectorCount: vector.size,
@@ -605,6 +642,7 @@ export function registerIndexMaintenanceFunctions(
       state: "running",
       ...(data.batchSize ? { batchSize: data.batchSize } : {}),
       ...(data.checkpointEvery ? { checkpointEvery: data.checkpointEvery } : {}),
+      ...(data.maxDurationMs ? { maxDurationMs: data.maxDurationMs } : {}),
       startedAt,
       progress: { scanned: 0, missing: 0, repaired: 0, failed: 0, checkpoints: 0 },
     };

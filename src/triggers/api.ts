@@ -373,17 +373,23 @@ export function registerApiTriggers(
       const body = (req.body ?? {}) as Record<string, unknown>;
       const batchSize = parseOptionalPositiveInt(body.batchSize);
       const checkpointEvery = parseOptionalPositiveInt(body.checkpointEvery);
-      if (batchSize === null || checkpointEvery === null) {
+      const maxDurationMs = parseOptionalPositiveInt(body.maxDurationMs);
+      if (
+        batchSize === null ||
+        checkpointEvery === null ||
+        maxDurationMs === null
+      ) {
         return {
           status_code: 400,
           body: {
-            error: "batchSize and checkpointEvery must be positive integers",
+            error:
+              "batchSize, checkpointEvery, and maxDurationMs must be positive integers",
           },
         };
       }
       const result = await sdk.trigger({
         function_id: "mem::index-repair",
-        payload: { batchSize, checkpointEvery, background: true },
+        payload: { batchSize, checkpointEvery, maxDurationMs, background: true },
       });
       return { status_code: 202, body: result };
     },
