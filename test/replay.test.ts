@@ -97,6 +97,29 @@ describe("parseJsonlText", () => {
     const out = parseJsonlText(text, "fb-used");
     expect(out.sessionId).toBe("fb-used");
   });
+
+  it("derives session bounds from the minimum and maximum valid source timestamps", () => {
+    const text = [
+      JSON.stringify({ type: "system", sessionId: "out-of-order" }),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-01-03T12:00:00.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "later" }] },
+      }),
+      JSON.stringify({
+        type: "user",
+        timestamp: "2026-01-01T00:00:00.440Z",
+        message: { role: "user", content: [{ type: "text", text: "earliest" }] },
+      }),
+      JSON.stringify({ type: "summary", timestamp: "not-a-date" }),
+      JSON.stringify({ type: "summary", timestamp: "2026-01-02T00:00:00.000Z" }),
+    ].join("\n");
+
+    const out = parseJsonlText(text);
+
+    expect(out.startedAt).toBe("2026-01-01T00:00:00.440Z");
+    expect(out.endedAt).toBe("2026-01-03T12:00:00.000Z");
+  });
 });
 
 describe("projectTimeline", () => {

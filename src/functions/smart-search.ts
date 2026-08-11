@@ -5,6 +5,8 @@ import type {
   CompressedObservation,
   HybridSearchResult,
   Lesson,
+  Memory,
+  Session,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -17,6 +19,7 @@ import {
 } from "../config.js";
 import { logger } from "../logger.js";
 import { getCounters } from "../telemetry/setup.js";
+import { memoryToObservation } from "../state/memory-utils.js";
 
 // #771: smart-search followup-rate diagnostic. Stored per session as
 // the most recent search payload, used to detect whether the next
@@ -71,6 +74,19 @@ export function resetFollowupStatsForTests(): void {
 // Compact mode trims each lesson's content for at-a-glance display. The
 // full content is fetched via memory_lesson_recall when the caller needs it.
 const LESSON_CONTENT_PREVIEW_CHARS = 240;
+
+function isLatestStatusQuery(query: string): boolean {
+  return /(?:最新|最近|当前|latest|recent|current).*(?:状态|进展|版本|完成|情况|status|progress|version)|(?:状态|进展|版本|完成|情况|status|progress|version).*(?:最新|最近|当前|latest|recent|current)/i.test(query);
+}
+
+function normalizeProjectText(value: string): string {
+  return value.toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+function memorySourceTime(memory: Memory): number {
+  const sourceEndedAt = (memory as Memory & { sourceEndedAt?: string }).sourceEndedAt;
+  return new Date(sourceEndedAt || memory.createdAt).getTime();
+}
 
 export function registerSmartSearchFunction(
   sdk: ISdk,
@@ -186,28 +202,98 @@ export function registerSmartSearchFunction(
       const lessonLimit = Math.min(limit, 10);
       const includeLessons = data.includeLessons !== false;
 
+      const latestIntent = isLatestStatusQuery(data.query);
+      let effectiveProject =
+        typeof data.project === "string" && data.project.trim()
+          ? data.project.trim()
+          : undefined;
+      let projectMemories: Memory[] = [];
+      if (effectiveProject || latestIntent) {
+        projectMemories = await kv.list<Memory>(KV.memories).catch(() => []);
+      }
+      if (!effectiveProject && latestIntent) {
+        const normalizedQuery = normalizeProjectText(data.query);
+        const candidates = [
+          ...new Set(
+            projectMemories
+              .map((memory) => memory.project)
+              .filter((project): project is string =>
+                typeof project === "string" && project.trim().length > 1
+              ),
+          ),
+        ]
+          .filter((project) => normalizedQuery.includes(normalizeProjectText(project)))
+          .sort((a, b) => b.length - a.length);
+        effectiveProject = candidates[0];
+      }
+
       // Over-fetch when filtering. Hybrid search can't filter on
       // agentId (BM25/vector indexes don't carry it), so we ask the
       // searcher for more hits than we need and trim post-filter. 3×
       // is a defensible middle ground: enough headroom for a small
       // workload, capped at 300 so a 100-limit request never asks for
       // thousands of hits.
-      const overFetchLimit = filterAgentId
-        ? Math.min(limit * 3, 300)
+      const overFetchLimit = filterAgentId || effectiveProject
+        ? Math.min(limit * 10, 300)
         : limit;
 
       const [hybridResults, lessons] = await Promise.all([
         searchFn(data.query, overFetchLimit),
         includeLessons
-          ? recallLessons(sdk, data.query, lessonLimit, data.project)
+          ? recallLessons(sdk, data.query, lessonLimit, effectiveProject)
           : Promise.resolve([]),
       ]);
 
-      const filteredHybrid = filterAgentId
-        ? hybridResults
-            .filter((r) => r.observation.agentId === filterAgentId)
-            .slice(0, limit)
-        : hybridResults.slice(0, limit);
+      const projectMatches = await Promise.all(
+        hybridResults.map(async (result) => {
+          if (filterAgentId && result.observation.agentId !== filterAgentId) {
+            return false;
+          }
+          if (!effectiveProject) return true;
+          if (result.observation.id.startsWith("mem_")) {
+            const memory = await kv
+              .get<Memory>(KV.memories, result.observation.id)
+              .catch(() => null);
+            if (memory?.project) return memory.project === effectiveProject;
+          }
+          const session = await kv
+            .get<Session>(KV.sessions, result.sessionId)
+            .catch(() => null);
+          return session?.project === effectiveProject;
+        }),
+      );
+      let filteredHybrid = hybridResults.filter((_, index) => projectMatches[index]);
+
+      if (latestIntent && effectiveProject) {
+        const temporalResults: HybridSearchResult[] = projectMemories
+          .filter(
+            (memory) =>
+              memory.project === effectiveProject &&
+              memory.isLatest !== false &&
+              !!memory.title &&
+              !!memory.content,
+          )
+          .sort((a, b) => memorySourceTime(b) - memorySourceTime(a))
+          .slice(0, Math.min(limit, 10))
+          .map((memory, index) => ({
+            observation: memoryToObservation(memory),
+            sessionId: memory.sessionIds?.[0] ?? "memory",
+            bm25Score: 0,
+            vectorScore: 0,
+            graphScore: 0,
+            combinedScore: 1 - index * 0.001,
+          }));
+        const temporalIds = new Set(
+          temporalResults.map((result) => result.observation.id),
+        );
+        filteredHybrid = temporalResults.concat(
+          filteredHybrid.filter(
+            (result) => !temporalIds.has(result.observation.id),
+          ),
+        );
+      }
+
+      filteredHybrid = filteredHybrid.slice(0, limit);
 
       const compact: CompactSearchResult[] = filteredHybrid.map((r) => ({
         obsId: r.observation.id,

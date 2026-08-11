@@ -100,6 +100,7 @@ interface Validated {
   concepts?: string[];
   files?: string[];
   query?: string;
+  project?: string;
   limit?: number;
   format?: string;
   tokenBudget?: number;
@@ -132,6 +133,10 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       }
       v.query = query.trim();
       v.limit = parseLimit(args["limit"]);
+      const project = args["project"];
+      if (typeof project === "string" && project.trim()) {
+        v.project = project.trim();
+      }
       const fmt = args["format"];
       if (typeof fmt === "string" && fmt.trim()) {
         v.format = fmt.trim().toLowerCase();
@@ -199,6 +204,7 @@ async function handleProxy(
     }
     case "memory_smart_search": {
       const body: Record<string, unknown> = { query: v.query, limit: v.limit };
+      if (v.project != null) body["project"] = v.project;
       if (v.format != null) body["format"] = v.format;
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
       const result = await handle.call("/agentmemory/smart-search", {
@@ -270,6 +276,7 @@ async function handleLocal(
       const all =
         await kvInstance.list<Record<string, unknown>>("mem:memories");
       const results = all
+        .filter((m) => !v.project || m["project"] === v.project)
         .filter((m) => {
           const text = [
             typeof m["title"] === "string" ? m["title"] : "",

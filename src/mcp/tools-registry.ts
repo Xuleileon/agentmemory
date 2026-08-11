@@ -130,6 +130,7 @@ export const CORE_TOOLS: McpToolDef[] = [
           description: "Comma-separated observation IDs to expand",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        project: { type: "string", description: "Exact project name to filter" },
       },
       required: ["query"],
     },

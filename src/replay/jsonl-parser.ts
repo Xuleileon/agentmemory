@@ -125,15 +125,26 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
   let cwd = "";
   let firstTs = "";
   let lastTs = "";
+  let firstTsMs = Infinity;
+  let lastTsMs = -Infinity;
 
   const observations: RawObservation[] = [];
 
   for (const entry of entries) {
     if (entry.sessionId && !sessionId) sessionId = entry.sessionId;
     if (typeof entry.cwd === "string" && entry.cwd.trim() && !cwd) cwd = entry.cwd;
-    const ts = entry.timestamp || new Date().toISOString();
-    if (!firstTs) firstTs = ts;
-    lastTs = ts;
+    const rawTs = typeof entry.timestamp === "string" ? entry.timestamp : "";
+    const parsedTsMs = rawTs ? Date.parse(rawTs) : NaN;
+    const hasValidTs = Number.isFinite(parsedTsMs);
+    const ts = hasValidTs ? rawTs : new Date().toISOString();
+    if (hasValidTs && parsedTsMs < firstTsMs) {
+      firstTsMs = parsedTsMs;
+      firstTs = rawTs;
+    }
+    if (hasValidTs && parsedTsMs > lastTsMs) {
+      lastTsMs = parsedTsMs;
+      lastTs = rawTs;
+    }
 
     const role = entry.message?.role;
     const content = entry.message?.content;

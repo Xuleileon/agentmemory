@@ -9,6 +9,7 @@ import type {
   CompressedObservation,
   HybridSearchResult,
   CompactSearchResult,
+  Memory,
   Session,
 } from "../src/types.js";
 
@@ -182,6 +183,85 @@ describe("Smart Search Function", () => {
 
     expect(log1?.count).toBe(1);
     expect(log2?.count).toBe(1);
+  });
+
+  it("filters hybrid results to the requested project", async () => {
+    const otherObs = makeObs({ id: "obs_other", sessionId: "ses_other", title: "Other project" });
+    await kv.set("mem:sessions", "ses_other", {
+      id: "ses_other",
+      project: "other-project",
+      cwd: "/other",
+      startedAt: "2026-02-02T00:00:00Z",
+      status: "completed",
+      observationCount: 1,
+    } satisfies Session);
+    searchResults = [
+      { observation: otherObs, bm25Score: 1, vectorScore: 0, combinedScore: 1, sessionId: "ses_other" },
+      ...searchResults,
+    ];
+
+    const result = (await sdk.trigger("mem::smart-search", {
+      query: "auth",
+      project: "my-project",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(result.results.map((item) => item.obsId)).toEqual(["obs_1", "obs_2"]);
+  });
+
+  it("returns the newest project memory first for an explicit latest-status query", async () => {
+    const newest: Memory = {
+      id: "mem_newest",
+      createdAt: "2026-05-26T17:31:28.749Z",
+      updatedAt: "2026-08-11T06:37:13.251Z",
+      type: "fact",
+      title: "Model 2 v0.14.0 release",
+      content: "File handle architecture is now the current state.",
+      concepts: ["v0.14.0"],
+      files: [],
+      sessionIds: ["ses_1"],
+      strength: 8,
+      version: 1,
+      isLatest: true,
+      project: "my-project",
+    };
+    await kv.set("mem:memories", newest.id, newest);
+
+    const result = (await sdk.trigger("mem::smart-search", {
+      query: "latest status and current version",
+      project: "my-project",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(result.results[0].obsId).toBe("mem_newest");
+    expect(result.results[0].timestamp).toBe("2026-05-26T17:31:28.749Z");
+  });
+
+  it("infers a project named in a natural-language latest-status query", async () => {
+    const newest: Memory = {
+      id: "mem_guanyuan_latest",
+      createdAt: "2026-05-26T17:31:28.749Z",
+      updatedAt: "2026-08-11T06:37:13.251Z",
+      type: "fact",
+      title: "Model 2 v0.14.0 release",
+      content: "File handle architecture is now the current state.",
+      concepts: ["v0.14.0"],
+      files: [],
+      sessionIds: ["ses_1"],
+      strength: 8,
+      version: 1,
+      isLatest: true,
+      project: "观远cli",
+    };
+    await kv.set("mem:memories", newest.id, newest);
+    searchResults = [];
+
+    const result = (await sdk.trigger("mem::smart-search", {
+      query: "观远 CLI 最新是什么状态",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(result.results[0].obsId).toBe("mem_guanyuan_latest");
   });
 
   it("expand mode records access for expanded observation ids (#119)", async () => {

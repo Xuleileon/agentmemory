@@ -279,6 +279,7 @@ export function registerMcpEndpoints(
                 query: args.query,
                 expandIds,
                 limit,
+                project: asNonEmptyString(args.project),
               },
             });
             return {

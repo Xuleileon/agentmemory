@@ -75,6 +75,23 @@ describe("MCP Prompts", () => {
     registerMcpEndpoints(sdk as never, kv as never);
   });
 
+  it("forwards memory_smart_search project to the search function", async () => {
+    let receivedPayload: Record<string, unknown> | undefined;
+    sdk.overrideTrigger("mem::smart-search", async (payload: Record<string, unknown>) => {
+      receivedPayload = payload;
+      return { mode: "compact", results: [] };
+    });
+
+    const fn = sdk.getFunction("mcp::tools::call")!;
+    const result = await fn(makeReq({
+      name: "memory_smart_search",
+      arguments: { query: "latest status", project: "my-project" },
+    }));
+
+    expect(result.status_code).toBe(200);
+    expect(receivedPayload?.project).toBe("my-project");
+  });
+
   it("lists 3 prompts", async () => {
     const fn = sdk.getFunction("mcp::prompts::list")!;
     const result = (await fn(makeReq())) as {

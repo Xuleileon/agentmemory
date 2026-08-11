@@ -50,6 +50,11 @@ describe("MCP tool surface default (#553)", () => {
     }
   });
 
+  it("memory_smart_search exposes an exact project filter", () => {
+    const tool = getAllTools().find((entry) => entry.name === "memory_smart_search");
+    expect(tool?.inputSchema.properties).toHaveProperty("project");
+  });
+
   it("plugin .mcp.json provides default env interpolation so CC parse never fails (#510)", () => {
     const raw = readFileSync("plugin/.mcp.json", "utf-8");
     const cfg = JSON.parse(raw) as {
