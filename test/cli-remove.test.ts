@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 let sandbox: string;
+const iiiBinary = process.platform === "win32" ? "iii.exe" : "iii";
 
 function ctx(overrides: Partial<RemoveContext> = {}): RemoveContext {
   return {
@@ -110,7 +111,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is alwaysAsk when version does not match", () => {
-    touch(".local/bin/iii", "fakebin");
+    touch(`.local/bin/${iiiBinary}`, "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "9.9.9" }),
       { force: false, keepData: false },
@@ -121,7 +122,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is auto-fixable when version matches pinned", () => {
-    touch(".local/bin/iii", "fakebin");
+    touch(`.local/bin/${iiiBinary}`, "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "0.11.2" }),
       { force: false, keepData: false },
@@ -139,7 +140,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("private ~/.agentmemory/bin/iii is removed without prompt", () => {
-    touch(".agentmemory/bin/iii", "fakebin");
+    touch(`.agentmemory/bin/${iiiBinary}`, "fakebin");
     const plan = buildRemovePlan(ctx(), { force: false, keepData: false });
     const item = plan.find((p) => p.id === "private-bin-iii")!;
     expect(item).toBeDefined();
