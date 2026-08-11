@@ -1428,8 +1428,17 @@ async function main() {
   }
 
   s.stop(c.ok("iii-engine is ready"));
-  await import("./index.js");
-  if (await waitForAgentmemoryReady(15000)) {
+  // A freshly started engine executes the configured worker through iii-exec.
+  // Importing the worker here at the same time registers a duplicate copy in
+  // this long-lived CLI process; that orphan can reconnect after a restart and
+  // make requests alternate between old and new code. Only self-host a worker
+  // when the configured exec path did not become ready.
+  let agentmemoryReady = await waitForAgentmemoryReady(15000);
+  if (!agentmemoryReady) {
+    await import("./index.js");
+    agentmemoryReady = await waitForAgentmemoryReady(15000);
+  }
+  if (agentmemoryReady) {
     const consoleState = await ensureIiiConsole();
     await maybeOfferGlobalInstall();
     printReadyHint(consoleState);

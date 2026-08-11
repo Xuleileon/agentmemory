@@ -26,4 +26,15 @@ describe("CLI second-instance guards (#1140)", () => {
     expect(probeIdx).toBeLessThan(bootIdx);
     expect(mainBody).toContain("already running on port");
   });
+
+  it("lets iii-exec boot the configured worker before importing a fallback", () => {
+    const mainBody = src.slice(src.indexOf("async function main()"));
+    const freshBoot = mainBody.slice(mainBody.indexOf("const started = await startEngine()"));
+    const readyIdx = freshBoot.indexOf("await waitForAgentmemoryReady");
+    const fallbackImportIdx = freshBoot.indexOf('await import("./index.js")');
+
+    expect(readyIdx).toBeGreaterThan(-1);
+    expect(fallbackImportIdx).toBeGreaterThan(-1);
+    expect(readyIdx).toBeLessThan(fallbackImportIdx);
+  });
 });
