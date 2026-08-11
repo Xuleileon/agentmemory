@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -111,6 +113,31 @@ describe("event::session::stopped consolidation fan-out", () => {
     expect((crystallizeCall![0] as { payload: unknown }).payload).toEqual({
       olderThanDays: 0,
     });
+  });
+
+  it("skips all stopped-session fan-out while maintenance is locked", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "agentmemory-maintenance-events-"));
+    const lockFile = join(tempRoot, "maintenance.lock");
+    writeFileSync(lockFile, "index repair");
+    process.env.AGENTMEMORY_MAINTENANCE_LOCK_FILE = lockFile;
+    try {
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, mockKV() as never);
+
+      const result = await handlers.get("event::session::stopped")!({
+        sessionId: "ses_1",
+      });
+
+      expect(result).toEqual({
+        success: true,
+        skipped: true,
+        reason: "maintenance_lock",
+      });
+      expect(trigger).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.AGENTMEMORY_MAINTENANCE_LOCK_FILE;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("skips consolidate-pipeline and auto-crystallize when consolidation disabled but still summarizes", async () => {

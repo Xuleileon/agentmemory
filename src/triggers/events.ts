@@ -10,6 +10,7 @@ import {
   isGraphExtractionEnabled,
 } from "../config.js";
 import { logger } from "../logger.js";
+import { isMaintenanceLocked } from "../maintenance.js";
 
 // Global marker recording when corpus consolidation last ran, used to debounce
 // the per-turn session-stop fan-out.
@@ -95,6 +96,9 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   });
 
   sdk.registerFunction("event::session::stopped", async (data: { sessionId: string; skipConsolidation?: boolean }) => {
+    if (isMaintenanceLocked()) {
+      return { success: true, skipped: true, reason: "maintenance_lock" };
+    }
     const summary = await sdk.trigger({ function_id: "mem::summarize", payload: data });
     const fireVoid = (function_id: string, payload: unknown) =>
       sdk

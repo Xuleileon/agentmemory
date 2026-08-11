@@ -1,5 +1,4 @@
 import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
-import { existsSync } from "node:fs";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -15,6 +14,7 @@ import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
 import { logger } from "../logger.js";
+import { isMaintenanceLocked } from "../maintenance.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -31,11 +31,6 @@ type Response = {
   headers?: Record<string, string>;
   body: unknown;
 };
-
-function isMaintenanceLocked(): boolean {
-  const lockFile = process.env.AGENTMEMORY_MAINTENANCE_LOCK_FILE?.trim();
-  return Boolean(lockFile && existsSync(lockFile));
-}
 
 function parseOptionalInt(raw: unknown): number | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
