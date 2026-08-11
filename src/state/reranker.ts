@@ -31,6 +31,44 @@ async function loadPipeline(): Promise<any> {
   return pipelineLoading;
 }
 
+export function extractRelevanceScore(output: unknown): number | null {
+  const entries = Array.isArray(output) ? output : [output];
+  if (entries.length === 0) return null;
+  if (
+    entries.length > 1 &&
+    entries.some(
+      (entry) =>
+        !entry ||
+        typeof entry !== "object" ||
+        typeof (entry as { label?: unknown }).label !== "string",
+    )
+  ) {
+    return null;
+  }
+
+  const entry = entries[0];
+  if (!entry || typeof entry !== "object") return null;
+  const score = (entry as { score?: unknown }).score;
+  if (
+    typeof score !== "number" ||
+    !Number.isFinite(score) ||
+    score < 0 ||
+    score > 1
+  ) {
+    return null;
+  }
+
+  const rawLabel = (entry as { label?: unknown }).label;
+  if (rawLabel === undefined && entries.length === 1) return score;
+  if (typeof rawLabel !== "string") return null;
+  const label = rawLabel.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["label_1", "relevant", "true"].includes(label)) return score;
+  if (["label_0", "not_relevant", "irrelevant", "false"].includes(label)) {
+    return 1 - score;
+  }
+  return null;
+}
+
 export async function rerank(
   query: string,
   results: HybridSearchResult[],
@@ -53,20 +91,26 @@ export async function rerank(
   for (const pair of pairs) {
     try {
       const output = await reranker(pair.text);
-      const score = Array.isArray(output) ? output[0]?.score ?? 0 : 0;
+      const score = extractRelevanceScore(output);
+      if (score === null) return results;
       scores.push({ result: pair.result, rerankScore: score });
     } catch {
-      scores.push({ result: pair.result, rerankScore: pair.result.combinedScore });
+      return results;
     }
   }
 
+  const scoreValues = scores.map((entry) => entry.rerankScore);
+  const scoreRange = Math.max(...scoreValues) - Math.min(...scoreValues);
+  if (!Number.isFinite(scoreRange) || scoreRange < 1e-6) return results;
+
   scores.sort((a, b) => b.rerankScore - a.rerankScore);
 
-  return scores.map((s, i) => ({
+  const reranked = scores.map((s, i) => ({
     ...s.result,
     combinedScore: s.rerankScore,
     rerankPosition: i + 1,
   }));
+  return reranked.concat(results.slice(candidates.length));
 }
 
 export function isRerankerAvailable(): boolean {
