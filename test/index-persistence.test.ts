@@ -790,4 +790,84 @@ describe("IndexPersistence", () => {
 
     await expect(persistence.load()).resolves.toBeDefined();
   });
+
+  it("coalesces concurrent saves and persists writes that arrive during a save", async () => {
+    const baseKv = mockKV();
+    let releaseFirstWrite!: () => void;
+    let markFirstWriteStarted!: () => void;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      markFirstWriteStarted = resolve;
+    });
+    const firstWriteGate = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let writes = 0;
+    let activeWrites = 0;
+    let maxConcurrentWrites = 0;
+    const guardedKv = {
+      ...baseKv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        writes++;
+        activeWrites++;
+        maxConcurrentWrites = Math.max(maxConcurrentWrites, activeWrites);
+        try {
+          if (writes === 1) {
+            markFirstWriteStarted();
+            await firstWriteGate;
+          }
+          return await baseKv.set(scope, key, data);
+        } finally {
+          activeWrites--;
+        }
+      }),
+    };
+    const bm25 = makeBm25("obs_1", "first generation");
+    const persistence = new IndexPersistence(guardedKv as never, bm25, null);
+
+    const firstSave = persistence.save();
+    await firstWriteStarted;
+    bm25.add(makeObs({ id: "obs_2", title: "second generation" }));
+    const secondSave = persistence.save();
+    releaseFirstWrite();
+    await Promise.all([firstSave, secondSave]);
+
+    const loaded = await persistence.load();
+    const status = persistence.getStatus();
+    expect(maxConcurrentWrites).toBe(1);
+    expect(loaded.bm25?.size).toBe(2);
+    expect(status.dirty).toBe(false);
+    expect(status.persistedGeneration).toBe(status.dirtyGeneration);
+  });
+
+  it("keeps a failed generation dirty and clears it after a successful retry", async () => {
+    const baseKv = mockKV();
+    let failNext = true;
+    const retryKv = {
+      ...baseKv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (failNext) {
+          failNext = false;
+          const err = new Error("TIMEOUT: state::set") as Error & { code?: string };
+          err.code = "TIMEOUT";
+          throw err;
+        }
+        return baseKv.set(scope, key, data);
+      }),
+    };
+    const persistence = new IndexPersistence(
+      retryKv as never,
+      makeBm25("obs_retry", "retry checkpoint"),
+      null,
+    );
+
+    await persistence.save();
+    expect(persistence.getStatus().dirty).toBe(true);
+    expect(persistence.getStatus().lastError).toContain("TIMEOUT");
+
+    await persistence.save();
+    const status = persistence.getStatus();
+    expect(status.dirty).toBe(false);
+    expect(status.lastError).toBeUndefined();
+    expect(status.persistedGeneration).toBe(status.dirtyGeneration);
+  });
 });

@@ -29,6 +29,20 @@ type IndexPersistenceOptions = {
   createGeneration?: () => string;
 };
 
+export interface IndexPersistenceStatus {
+  dirtyGeneration: number;
+  persistedGeneration: number;
+  dirty: boolean;
+  saving: boolean;
+  lastSuccessAt?: string;
+  lastErrorAt?: string;
+  lastError?: string;
+  memoryBm25Count: number;
+  memoryVectorCount: number;
+  persistedBm25Count: number;
+  persistedVectorCount: number;
+}
+
 function shardChars(options: IndexPersistenceOptions): number {
   const configured = options.shardChars;
   if (typeof configured !== "number" || !Number.isFinite(configured)) {
@@ -68,6 +82,14 @@ function isValidShardDescriptor(
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
+  private dirtyGeneration = 0;
+  private persistedGeneration = 0;
+  private savePromise: Promise<void> | null = null;
+  private lastSuccessAt: string | undefined;
+  private lastErrorAt: string | undefined;
+  private lastError: string | undefined;
+  private persistedBm25Count = 0;
+  private persistedVectorCount = 0;
 
   constructor(
     private kv: StateKV,
@@ -77,29 +99,71 @@ export class IndexPersistence {
   ) {}
 
   scheduleSave(): void {
+    this.dirtyGeneration++;
     if (this.timer) clearTimeout(this.timer);
     // setTimeout discards the returned promise, so any rejection inside
     // save() would surface as unhandledRejection and crash the process
     // under sustained iii-engine write timeouts (issue #204). Funnel
     // rejections through logFailure() instead.
     this.timer = setTimeout(() => {
-      this.save().catch((err) => this.logFailure(err));
+      this.timer = null;
+      void this.flushDirty();
     }, DEBOUNCE_MS);
   }
 
-  async save(): Promise<void> {
+  save(): Promise<void> {
+    this.dirtyGeneration++;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    try {
-      await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
+    return this.flushDirty();
+  }
+
+  getStatus(): IndexPersistenceStatus {
+    return {
+      dirtyGeneration: this.dirtyGeneration,
+      persistedGeneration: this.persistedGeneration,
+      dirty: this.dirtyGeneration > this.persistedGeneration,
+      saving: this.savePromise !== null,
+      lastSuccessAt: this.lastSuccessAt,
+      lastErrorAt: this.lastErrorAt,
+      lastError: this.lastError,
+      memoryBm25Count: this.bm25.size,
+      memoryVectorCount: this.vector?.size ?? 0,
+      persistedBm25Count: this.persistedBm25Count,
+      persistedVectorCount: this.persistedVectorCount,
+    };
+  }
+
+  private flushDirty(): Promise<void> {
+    if (this.savePromise) return this.savePromise;
+
+    const run = async (): Promise<void> => {
+      while (this.persistedGeneration < this.dirtyGeneration) {
+        const targetGeneration = this.dirtyGeneration;
+        try {
+          await this.saveBm25Index(this.bm25.serialize());
+          if (this.vector) {
+            await this.saveVectorIndex(this.vector.serialize());
+          }
+          this.persistedGeneration = targetGeneration;
+          this.persistedBm25Count = this.bm25.size;
+          this.persistedVectorCount = this.vector?.size ?? 0;
+          this.lastSuccessAt = new Date().toISOString();
+          this.lastErrorAt = undefined;
+          this.lastError = undefined;
+        } catch (err) {
+          this.recordFailure(err);
+          break;
+        }
       }
-    } catch (err) {
-      this.logFailure(err);
-    }
+    };
+
+    this.savePromise = run().finally(() => {
+      this.savePromise = null;
+    });
+    return this.savePromise;
   }
 
   async load(): Promise<{
@@ -112,11 +176,13 @@ export class IndexPersistence {
     const bm25Data = await this.loadBm25Data();
     if (bm25Data && typeof bm25Data === "string") {
       bm25 = SearchIndex.deserialize(bm25Data);
+      this.persistedBm25Count = bm25.size;
     }
 
     const vecData = await this.loadVectorData();
     if (vecData && typeof vecData === "string") {
       vector = VectorIndex.deserialize(vecData);
+      this.persistedVectorCount = vector.size;
     }
 
     return { bm25, vector };
@@ -146,6 +212,12 @@ export class IndexPersistence {
           ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next debounce flush"
           : undefined,
     });
+  }
+
+  private recordFailure(err: unknown): void {
+    this.lastErrorAt = new Date().toISOString();
+    this.lastError = errorMessage(err);
+    this.logFailure(err);
   }
 
   private async saveBm25Index(serialized: string): Promise<void> {
