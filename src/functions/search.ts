@@ -6,6 +6,7 @@ import { SearchIndex } from '../state/search-index.js'
 import { VectorIndex } from '../state/vector-index.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
+import { classifyRetrievalQuality } from '../state/retrieval-quality.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -647,7 +648,13 @@ export function registerSearchFunction(
       // queries return underfilled pages when same-agent matches
       // rank lower than cross-agent ones in the hybrid score.
       const filtering = !!(projectFilter || cwdFilter || filterAgentId)
-      const fetchLimit = filtering ? Math.max(effectiveLimit * 10, 100) : effectiveLimit
+      const qualityFetchLimit = Math.min(
+        Math.max(effectiveLimit * 8, 40),
+        400,
+      )
+      const fetchLimit = filtering
+        ? Math.max(qualityFetchLimit, effectiveLimit * 10, 100)
+        : qualityFetchLimit
       const results = searchBackend
         ? await searchBackend.lexicalSearch(query, fetchLimit)
         : idx.search(query, fetchLimit)
@@ -684,7 +691,7 @@ export function registerSearchFunction(
       // rows, and capping early would underfill the result page. Use
       // fetchLimit as the upper bound in that case; the final
       // truncation lives at the end of the second pass.
-      const earlyCap = filterAgentId ? fetchLimit : effectiveLimit
+      const earlyCap = fetchLimit
       const candidates: typeof results = []
       for (const r of results) {
         if (candidates.length >= earlyCap) break
@@ -743,17 +750,21 @@ export function registerSearchFunction(
         // happens post-lookup. Wildcard ("*") and no-isolation paths
         // resolved filterAgentId=undefined upstream and pass through.
         if (filterAgentId !== undefined && obs.agentId !== filterAgentId) continue
-        if (enriched.length >= effectiveLimit) break
+        const quality = classifyRetrievalQuality(obs)
+        if (quality.exclude) continue
         enriched.push({
           observation: obs,
-          score: candidates[i].score,
+          score: candidates[i].score * quality.multiplier,
           sessionId: candidates[i].sessionId,
         })
       }
 
+      enriched.sort((a, b) => b.score - a.score)
+      const selected = enriched.slice(0, effectiveLimit)
+
       void recordAccessBatch(
         kv,
-        enriched.map((r) => r.observation.id),
+        selected.map((r) => r.observation.id),
       )
 
       const estimateTokens = (value: unknown): number =>
@@ -779,7 +790,7 @@ export function registerSearchFunction(
       }
 
       if (format === 'compact') {
-        const compactResults: CompactSearchResult[] = enriched.map((r) => ({
+        const compactResults: CompactSearchResult[] = selected.map((r) => ({
           obsId: r.observation.id,
           sessionId: r.sessionId,
           title: r.observation.title,
@@ -798,7 +809,7 @@ export function registerSearchFunction(
       }
 
       if (format === 'narrative') {
-        const narrativeResults = enriched.map((r) => ({
+        const narrativeResults = selected.map((r) => ({
           obsId: r.observation.id,
           sessionId: r.sessionId,
           title: r.observation.title,
@@ -820,7 +831,7 @@ export function registerSearchFunction(
         }
       }
 
-      const packed = applyTokenBudget(enriched)
+      const packed = applyTokenBudget(selected)
 
       // Avoid logging raw cwd/project (host paths). Log only that filters were active.
       logger.info('Search completed', {

@@ -32,7 +32,6 @@ export function isAgentMemoryRetrievalToolName(
 }
 
 function historicalSelfRetrieval(observation: CompressedObservation): boolean {
-  if (observation.type !== "search") return false;
   const evidence = [
     observation.title,
     observation.subtitle ?? "",
@@ -47,8 +46,10 @@ function historicalSelfRetrieval(observation: CompressedObservation): boolean {
     return true;
   }
 
-  return /^memory\s+(?:recall|search|smart\s+search)\s+for\b/i.test(
-    observation.title.trim(),
+  const title = observation.title.trim();
+  return (
+    /^memory\s+(?:recall|search|smart\s+search)(?:\s+for\b|\s*:)/i.test(title) ||
+    /^(?:executed\s+)?smart\s+memory\s+search(?:\s+for\b|\s*:)/i.test(title)
   );
 }
 

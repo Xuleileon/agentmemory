@@ -8,6 +8,7 @@ import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, s
 import { VectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Session } from "../src/types.js";
+import type { SearchBackend } from "../src/state/search-backend.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -208,5 +209,63 @@ describe("mem::search", () => {
     // Cleanup
     setVectorIndex(null);
     setEmbeddingProvider(null);
+  });
+
+  it("filters historical self-search telemetry and replenishes recall results", async () => {
+    const telemetry: CompressedObservation = {
+      id: "obs_memory_search",
+      sessionId: "ses_1",
+      timestamp: "2026-08-11T00:00:00Z",
+      type: "command_run",
+      title: "Memory search for auth middleware",
+      facts: [],
+      narrative: "Agent queried memory for auth middleware.",
+      concepts: ["memory search"],
+      files: [],
+      importance: 3,
+    };
+    await kv.set(KV.observations("ses_1"), telemetry.id, telemetry);
+    await kv.set(KV.memories, "mem_auth_decision", {
+      id: "mem_auth_decision",
+      createdAt: "2026-08-10T00:00:00Z",
+      updatedAt: "2026-08-10T00:00:00Z",
+      type: "architecture",
+      title: "Auth middleware architecture decision",
+      content: "Use rotating JWT refresh tokens.",
+      concepts: ["auth", "jwt"],
+      files: ["src/auth.ts"],
+      sessionIds: [],
+      strength: 9,
+      version: 1,
+      isLatest: true,
+    });
+    const backend = {
+      lexicalSearch: async () => [
+        { obsId: telemetry.id, sessionId: telemetry.sessionId, score: 10 },
+        { obsId: "mem_auth_decision", sessionId: "memory", score: 9 },
+      ],
+      vectorSearch: async () => [],
+    } as Pick<SearchBackend, "lexicalSearch" | "vectorSearch">;
+    registerSearchFunction(
+      sdk as never,
+      kv as never,
+      async () => 0,
+      backend,
+    );
+
+    const result = (await sdk.trigger("mem::search", {
+      query: "auth middleware",
+      format: "compact",
+      limit: 1,
+    })) as { results: Array<{ obsId: string }> };
+
+    expect(result.results).toEqual([{
+      obsId: "mem_auth_decision",
+      sessionId: "memory",
+      title: "Auth middleware architecture decision",
+      type: "decision",
+      score: 13.5,
+      timestamp: "2026-08-10T00:00:00Z",
+    }]);
   });
 });

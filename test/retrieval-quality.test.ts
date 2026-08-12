@@ -76,6 +76,25 @@ describe("retrieval quality policy", () => {
     expect(result.reason).toBe("historical-self-retrieval");
   });
 
+  it.each([
+    "Memory search for auto display switcher",
+    "Memory recall: screen blackout during resolution switch",
+    "Executed smart memory search for remote display and input tools",
+    "Smart memory search for display orientation auto-switch",
+  ])("excludes historical telemetry regardless of compressed type: %s", (title) => {
+    const result = classifyRetrievalQuality(
+      observation({
+        type: "command_run",
+        title,
+        narrative: "Agent queried memory and inspected the returned matches.",
+        importance: 3,
+      }),
+    );
+
+    expect(result.exclude).toBe(true);
+    expect(result.reason).toBe("historical-self-retrieval");
+  });
+
   it("keeps ordinary Glob observations searchable", () => {
     const result = classifyRetrievalQuality(
       observation({
