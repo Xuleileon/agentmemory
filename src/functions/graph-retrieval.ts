@@ -1,6 +1,7 @@
 import type {
   GraphNode,
   GraphEdge,
+  GraphSnapshot,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -39,15 +40,56 @@ function buildGraphContext(
 }
 
 export class GraphRetrieval {
-  constructor(private kv: StateKV) {}
+  private graphData: Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> | null = null;
+  private graphDataLoadedAt = 0;
+
+  constructor(
+    private kv: StateKV,
+    private readonly allowFullScan = true,
+  ) {}
+
+  private async loadGraphData(): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
+    const now = Date.now();
+    if (this.graphData && now - this.graphDataLoadedAt < 30_000) {
+      return this.graphData;
+    }
+    this.graphDataLoadedAt = now;
+    this.graphData = (async () => {
+      const snapshot = await this.kv
+        .get<GraphSnapshot>(KV.graphSnapshot, "current")
+        .catch(() => null);
+      if (
+        snapshot?.version === 1 &&
+        Array.isArray(snapshot.topNodes) &&
+        Array.isArray(snapshot.topEdges)
+      ) {
+        return {
+          nodes: snapshot.topNodes.filter((node) => !node.stale),
+          edges: snapshot.topEdges.filter((edge) => !edge.stale),
+        };
+      }
+      if (!this.allowFullScan) return { nodes: [], edges: [] };
+      const [nodes, edges] = await Promise.all([
+        this.kv.list<GraphNode>(KV.graphNodes),
+        this.kv.list<GraphEdge>(KV.graphEdges),
+      ]);
+      return {
+        nodes: nodes.filter((node) => !node.stale),
+        edges: edges.filter((edge) => !edge.stale),
+      };
+    })().catch((error) => {
+      this.graphData = null;
+      throw error;
+    });
+    return this.graphData;
+  }
 
   async searchByEntities(
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraphData();
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -119,8 +161,7 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraphData();
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),

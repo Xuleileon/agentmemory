@@ -2,6 +2,7 @@ param(
   [int]$ProbeIntervalSeconds = 5,
   [int]$FailureThreshold = 3,
   [int]$StartupGraceSeconds = 180,
+  [int]$EnginePort = 49134,
   [string]$HealthUrl = 'http://127.0.0.1:3111/agentmemory/livez'
 )
 
@@ -26,8 +27,9 @@ if (-not [System.IO.Path]::IsPathFullyQualified($repoRoot) -or
     -not [System.IO.Path]::IsPathFullyQualified($configPath)) {
   throw 'watchdog paths must be absolute'
 }
-if ($ProbeIntervalSeconds -lt 1 -or $FailureThreshold -lt 1 -or $StartupGraceSeconds -lt 1) {
-  throw 'watchdog intervals, thresholds, and startup grace must be positive integers'
+if ($ProbeIntervalSeconds -lt 1 -or $FailureThreshold -lt 1 -or $StartupGraceSeconds -lt 1 -or
+    $EnginePort -lt 1 -or $EnginePort -gt 65535) {
+  throw 'watchdog intervals, thresholds, startup grace, and engine port must be valid positive integers'
 }
 if (-not (Test-Path -LiteralPath $iiiPath -PathType Leaf)) {
   throw "iii binary not found: $iiiPath"
@@ -112,6 +114,27 @@ function Stop-ManagedStack {
   }
 }
 
+function Wait-EngineReady([System.Diagnostics.Process]$Process) {
+  $deadline = (Get-Date).AddSeconds($StartupGraceSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if ($Process.HasExited) {
+      throw "iii exited before engine port $EnginePort became ready (exit code $($Process.ExitCode))"
+    }
+
+    $listener = Get-NetTCPConnection -State Listen -LocalPort $EnginePort -ErrorAction SilentlyContinue |
+      Where-Object { $_.OwningProcess -eq $Process.Id } |
+      Select-Object -First 1
+    if ($null -ne $listener) {
+      Write-WatchdogLog "iii engine ready pid=$($Process.Id) port=$EnginePort"
+      return
+    }
+
+    Start-Sleep -Seconds 1
+  }
+
+  throw "iii engine port $EnginePort did not become ready within ${StartupGraceSeconds}s"
+}
+
 function Start-ManagedStack {
   if (@(Get-ManagedEngines).Count -ne 0 -or @(Get-ManagedWorkers).Count -ne 0) {
     throw 'managed engine or worker still exists before start'
@@ -140,8 +163,11 @@ function Start-ManagedStack {
   # Production supervision owns the worker explicitly. Relying on iii-exec
   # alone leaves the REST engine alive with no AgentMemory routes when its
   # child launch is missed; that produces an endless healthy-engine/404 loop.
-  # The SDK reconnects while iii finishes starting, and both PIDs are then
-  # covered by the same structural health check above.
+  # The file-backed state workers can take over a minute to initialize before
+  # iii opens its WebSocket listener. Starting Node earlier pushes the SDK into
+  # exponential reconnect backoff, making registration slow and nondeterministic.
+  Wait-EngineReady -Process $process
+
   $workerArgs = @{
     FilePath = $nodePath
     ArgumentList = @($workerPath)

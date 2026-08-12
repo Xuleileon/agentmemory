@@ -597,7 +597,7 @@ async function main() {
       .catch((err) => {
         console.warn(`[agentmemory] Failed to rebuild search index:`, err);
       });
-  } else {
+  } else if (searchConfig.mode !== "lance") {
     // Backfill memories into BM25 for users upgrading from <0.9.5: prior
     // versions of mem::remember never indexed memories, so the persisted
     // BM25 covers observations only and `memory_smart_search` returns

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
-import type { GraphNode, GraphEdge } from "../src/types.js";
+import type { GraphNode, GraphEdge, GraphSnapshot } from "../src/types.js";
 
 function mockKV(
   nodes: GraphNode[] = [],
@@ -71,6 +71,61 @@ function makeEdge(
 }
 
 describe("GraphRetrieval", () => {
+  it("uses and reuses the bounded graph snapshot instead of enumerating full scopes", async () => {
+    const nodes = [
+      makeNode("n1", "AgentMemory", "project", ["obs_1"]),
+      makeNode("n2", "LanceDB", "database", ["obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const snapshot: GraphSnapshot = {
+      version: 1,
+      topNodes: nodes,
+      topEdges: edges,
+      topDegrees: { n1: 1, n2: 1 },
+      stats: { totalNodes: 20_000, totalEdges: 30_000, nodesByType: {}, edgesByType: {} },
+      updatedAt: new Date().toISOString(),
+      dirty: false,
+    };
+    let listCalls = 0;
+    let snapshotReads = 0;
+    const kv = {
+      get: async (scope: string, key: string) => {
+        if (scope === "mem:graph:snapshot" && key === "current") {
+          snapshotReads++;
+          return snapshot;
+        }
+        return null;
+      },
+      list: async () => {
+        listCalls++;
+        throw new Error("full graph enumeration must not run");
+      },
+    };
+    const retrieval = new GraphRetrieval(kv as never);
+
+    expect((await retrieval.searchByEntities(["AgentMemory"])).map((r) => r.obsId))
+      .toContain("obs_2");
+    expect((await retrieval.expandFromChunks(["obs_1"])).map((r) => r.obsId))
+      .toContain("obs_2");
+    expect(snapshotReads).toBe(1);
+    expect(listCalls).toBe(0);
+  });
+
+  it("fails soft without a snapshot when online full scans are disabled", async () => {
+    let listCalls = 0;
+    const kv = {
+      get: async () => null,
+      list: async () => {
+        listCalls++;
+        return [makeNode("n1", "Hidden", "concept", ["obs_1"])];
+      },
+    };
+    const retrieval = new GraphRetrieval(kv as never, false);
+
+    expect(await retrieval.searchByEntities(["Hidden"])).toEqual([]);
+    expect(listCalls).toBe(0);
+  });
+
   it("finds entities by name", async () => {
     const nodes = [
       makeNode("n1", "React", "library", ["obs_1"]),

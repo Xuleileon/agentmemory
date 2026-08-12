@@ -37,7 +37,10 @@ export class HybridSearch {
       "lexicalSearch" | "vectorSearch"
     >,
   ) {
-    this.graphRetrieval = new GraphRetrieval(kv);
+    // Online recall must never enumerate the full graph. A healthy graph
+    // snapshot is an optional bounded enhancement; if it is missing, search
+    // continues with lexical + vector instead of blocking on 20K+ KV rows.
+    this.graphRetrieval = new GraphRetrieval(kv, false);
   }
 
   async search(query: string, limit = 20): Promise<HybridSearchResult[]> {
@@ -84,52 +87,46 @@ export class HybridSearch {
     limit: number,
     entityHints?: string[],
   ): Promise<HybridSearchResult[]> {
-    const bm25Results = this.searchBackend
-      ? await this.searchBackend.lexicalSearch(query, limit * 2)
-      : this.bm25.search(query, limit * 2);
-
-    let vectorResults: Array<{
+    type RankedHit = {
       obsId: string;
       sessionId: string;
       score: number;
-    }> = [];
-    let queryEmbedding: Float32Array | null = null;
+    };
 
-    if (this.searchBackend && this.embeddingProvider) {
+    const lexicalPromise: Promise<RankedHit[]> = this.searchBackend
+      ? this.searchBackend.lexicalSearch(query, limit * 2)
+      : Promise.resolve(this.bm25.search(query, limit * 2));
+
+    const vectorPromise: Promise<RankedHit[]> = (async () => {
+      if (!this.embeddingProvider) return [];
       try {
-        queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = await this.searchBackend.vectorSearch(
-          queryEmbedding,
-          limit * 2,
-        );
+        const queryEmbedding = await this.embeddingProvider.embed(query);
+        if (this.searchBackend) {
+          return await this.searchBackend.vectorSearch(queryEmbedding, limit * 2);
+        }
+        if (this.vector && this.vector.size > 0) {
+          return this.vector.search(queryEmbedding, limit * 2);
+        }
       } catch {
         // fall through to lexical-only
       }
-    } else if (this.vector && this.embeddingProvider && this.vector.size > 0) {
-      try {
-        queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = this.vector.search(queryEmbedding, limit * 2);
-      } catch {
-        // fall through to BM25-only
-      }
-    }
+      return [];
+    })();
 
     const entities =
       entityHints && entityHints.length > 0
         ? entityHints
         : extractEntitiesFromQuery(query);
-    let graphResults: GraphRetrievalResult[] = [];
-    if (entities.length > 0) {
-      try {
-        graphResults = await this.graphRetrieval.searchByEntities(
-          entities,
-          2,
-          limit,
-        );
-      } catch {
-        // graph search is best-effort
-      }
-    }
+    const graphPromise: Promise<GraphRetrievalResult[]> = entities.length > 0
+      ? this.graphRetrieval.searchByEntities(entities, 2, limit).catch(() => [])
+      : Promise.resolve([]);
+
+    const [bm25Results, vectorResults, initialGraphResults] = await Promise.all([
+      lexicalPromise,
+      vectorPromise,
+      graphPromise,
+    ]);
+    let graphResults = initialGraphResults;
 
     const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
     if (topVectorObs.length > 0) {

@@ -28,6 +28,8 @@
     "skills:gen": "tsx scripts/skills/generate.ts",
     "skills:check": "tsx scripts/skills/generate.ts --check && tsx scripts/skills/check.ts",
     "bench:load": "node --import tsx benchmark/load-100k.ts",
+    "search:migrate-legacy": "node --import tsx scripts/migrate-legacy-index-to-lance.ts",
+    "search:verify-lance": "node --import tsx scripts/verify-lance-search.ts",
     "eval:longmemeval": "tsx eval/runner/longmemeval.ts",
     "eval:coding-life": "tsx eval/runner/coding-life.ts"
   },
