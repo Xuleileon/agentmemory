@@ -17,6 +17,7 @@ import {
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
 import type { SearchBackend } from "./search-backend.js";
+import { classifyRetrievalQuality } from "./retrieval-quality.js";
 
 const RRF_K = 60;
 
@@ -93,19 +94,24 @@ export class HybridSearch {
       score: number;
     };
 
+    // Quality filtering happens after KV enrichment because the Lance row is
+    // intentionally minimal. Fetch enough bounded candidates that telemetry
+    // and generic hook observations cannot consume the caller's whole window.
+    const candidateDepth = Math.min(Math.max(limit * 8, 40), 400);
+
     const lexicalPromise: Promise<RankedHit[]> = this.searchBackend
-      ? this.searchBackend.lexicalSearch(query, limit * 2)
-      : Promise.resolve(this.bm25.search(query, limit * 2));
+      ? this.searchBackend.lexicalSearch(query, candidateDepth)
+      : Promise.resolve(this.bm25.search(query, candidateDepth));
 
     const vectorPromise: Promise<RankedHit[]> = (async () => {
       if (!this.embeddingProvider) return [];
       try {
         const queryEmbedding = await this.embeddingProvider.embed(query);
         if (this.searchBackend) {
-          return await this.searchBackend.vectorSearch(queryEmbedding, limit * 2);
+          return await this.searchBackend.vectorSearch(queryEmbedding, candidateDepth);
         }
         if (this.vector && this.vector.size > 0) {
-          return this.vector.search(queryEmbedding, limit * 2);
+          return this.vector.search(queryEmbedding, candidateDepth);
         }
       } catch {
         // fall through to lexical-only
@@ -118,7 +124,9 @@ export class HybridSearch {
         ? entityHints
         : extractEntitiesFromQuery(query);
     const graphPromise: Promise<GraphRetrievalResult[]> = entities.length > 0
-      ? this.graphRetrieval.searchByEntities(entities, 2, limit).catch(() => [])
+      ? this.graphRetrieval
+          .searchByEntities(entities, 2, candidateDepth)
+          .catch(() => [])
       : Promise.resolve([]);
 
     const [bm25Results, vectorResults, initialGraphResults] = await Promise.all([
@@ -234,39 +242,48 @@ export class HybridSearch {
 
     combined.sort((a, b) => b.combinedScore - a.combinedScore);
 
-    const retrievalDepth = Math.max(limit, 20);
     const rerankWindow = 20;
-    const diversified = this.diversifyBySession(combined, retrievalDepth);
-    const enriched = await this.enrichResults(diversified, retrievalDepth);
+    const enriched = await this.enrichResults(combined, candidateDepth);
+    const qualityRanked = enriched
+      .flatMap((result) => {
+        const quality = classifyRetrievalQuality(result.observation);
+        if (quality.exclude) return [];
+        return [{
+          ...result,
+          combinedScore: result.combinedScore * quality.multiplier,
+        }];
+      })
+      .sort((a, b) => b.combinedScore - a.combinedScore);
+    const diversified = this.diversifyBySession(qualityRanked, candidateDepth);
 
-    if (this.rerankEnabled && enriched.length > 1) {
+    if (this.rerankEnabled && diversified.length > 1) {
       try {
-        const head = enriched.slice(0, rerankWindow);
-        const tail = enriched.slice(rerankWindow);
+        const head = diversified.slice(0, rerankWindow);
+        const tail = diversified.slice(rerankWindow);
         const reranked = await rerank(query, head, rerankWindow);
-        return reranked.concat(tail).slice(0, limit);
+        const qualityReranked = reranked
+          .map((result) => ({
+            ...result,
+            combinedScore:
+              result.combinedScore *
+              classifyRetrievalQuality(result.observation).multiplier,
+          }))
+          .sort((a, b) => b.combinedScore - a.combinedScore);
+        return qualityReranked.concat(tail).slice(0, limit);
       } catch {
-        return enriched.slice(0, limit);
+        return diversified.slice(0, limit);
       }
     }
 
-    return enriched.slice(0, limit);
+    return diversified.slice(0, limit);
   }
 
-  private diversifyBySession(
-    results: Array<{
-      obsId: string;
-      sessionId: string;
-      bm25Score: number;
-      vectorScore: number;
-      graphScore: number;
-      combinedScore: number;
-      graphContext?: string;
-    }>,
+  private diversifyBySession<T extends { sessionId: string }>(
+    results: T[],
     limit: number,
     maxPerSession = 3,
-  ): typeof results {
-    const selected: typeof results = [];
+  ): T[] {
+    const selected: T[] = [];
     const sessionCounts = new Map<string, number>();
 
     for (const r of results) {

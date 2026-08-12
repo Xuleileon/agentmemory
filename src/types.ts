@@ -61,6 +61,10 @@ export interface CompressedObservation {
   imageDescription?: string;
   modality?: "text" | "image" | "mixed";
   agentId?: string;
+  /** Capture provenance retained for retrieval-quality decisions. */
+  sourceHookType?: HookType;
+  /** Original agent tool name, before compression normalized the title/type. */
+  sourceToolName?: string;
 }
 
 export type ObservationType =

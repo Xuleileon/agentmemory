@@ -16,6 +16,7 @@ import {
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import { shouldProjectObservation } from "../state/retrieval-quality.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -301,26 +302,28 @@ export function registerObserveFunction(
           });
         } else {
           const synthetic = buildSyntheticCompression(raw);
-          await prepareSearchUpsert({
-            id: synthetic.id,
-            sessionId: synthetic.sessionId,
-            updatedAt: synthetic.timestamp,
-            ...(synthetic.agentId ? { agentId: synthetic.agentId } : {}),
-            kind: "synthetic",
-          });
           await kv.set(
             KV.observations(payload.sessionId),
             obsId,
             synthetic,
           );
-          getSearchIndex().add(synthetic);
-          await vectorIndexAddGuarded(
-            synthetic.id,
-            synthetic.sessionId,
-            synthetic.title + " " + (synthetic.narrative || ""),
-            { kind: "synthetic", logId: synthetic.id },
-          );
-          scheduleIndexSave();
+          if (shouldProjectObservation(synthetic)) {
+            await prepareSearchUpsert({
+              id: synthetic.id,
+              sessionId: synthetic.sessionId,
+              updatedAt: synthetic.timestamp,
+              ...(synthetic.agentId ? { agentId: synthetic.agentId } : {}),
+              kind: "synthetic",
+            });
+            getSearchIndex().add(synthetic);
+            await vectorIndexAddGuarded(
+              synthetic.id,
+              synthetic.sessionId,
+              synthetic.title + " " + (synthetic.narrative || ""),
+              { kind: "synthetic", logId: synthetic.id },
+            );
+            scheduleIndexSave();
+          }
           await sdk.trigger({
             function_id: "stream::set",
             payload: {

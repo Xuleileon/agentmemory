@@ -7,6 +7,7 @@ import type {
   ObservationType,
   MemoryProvider,
 } from "../types.js";
+import { shouldProjectObservation } from "../state/retrieval-quality.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import {
@@ -171,39 +172,43 @@ export function registerCompressFunction(
           ...(imageDescription ? { imageDescription } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
+          sourceHookType: data.raw.hookType,
+          ...(data.raw.toolName ? { sourceToolName: data.raw.toolName } : {}),
         };
 
-        await prepareSearchUpsert({
-          id: compressed.id,
-          sessionId: compressed.sessionId,
-          updatedAt: compressed.timestamp,
-          ...(compressed.agentId ? { agentId: compressed.agentId } : {}),
-          kind: "observation",
-        });
         await kv.set(
           KV.observations(data.sessionId),
           data.observationId,
           compressed,
         );
 
-        try {
-          getSearchIndex().add(compressed);
-        } catch (err) {
-          logger.warn("Failed to index compressed observation into BM25", {
-            obsId: compressed.id,
+        if (shouldProjectObservation(compressed)) {
+          await prepareSearchUpsert({
+            id: compressed.id,
             sessionId: compressed.sessionId,
-            title: compressed.title,
-            error: err instanceof Error ? err.message : String(err),
+            updatedAt: compressed.timestamp,
+            ...(compressed.agentId ? { agentId: compressed.agentId } : {}),
+            kind: "observation",
           });
-        }
+          try {
+            getSearchIndex().add(compressed);
+          } catch (err) {
+            logger.warn("Failed to index compressed observation into BM25", {
+              obsId: compressed.id,
+              sessionId: compressed.sessionId,
+              title: compressed.title,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
 
-        await vectorIndexAddGuarded(
-          compressed.id,
-          compressed.sessionId,
-          compressed.title + " " + (compressed.narrative || ""),
-          { kind: "observation", logId: compressed.id },
-        );
-        scheduleIndexSave();
+          await vectorIndexAddGuarded(
+            compressed.id,
+            compressed.sessionId,
+            compressed.title + " " + (compressed.narrative || ""),
+            { kind: "observation", logId: compressed.id },
+          );
+          scheduleIndexSave();
+        }
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({

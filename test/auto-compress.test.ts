@@ -231,6 +231,8 @@ describe("buildSyntheticCompression", () => {
     expect(synth.files).toContain("/app/src/bar.ts");
     expect(synth.files).toContain("foo");
     expect(synth.type).toBe("file_edit");
+    expect(synth.sourceHookType).toBe("post_tool_use");
+    expect(synth.sourceToolName).toBe("Edit");
   });
 
   it("truncates long narratives so it can't blow up the index", async () => {

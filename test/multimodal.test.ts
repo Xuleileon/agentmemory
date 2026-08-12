@@ -139,8 +139,18 @@ describe("End-to-End Multimodal Flow", () => {
 
     expect(compressCallback).not.toBeNull();
 
-    const rawObsList = await kv.list("mem:obs:test-session");
-    const raw = rawObsList[0] as RawObservation;
+    const storedObsList = await kv.list("mem:obs:test-session");
+    const stored = storedObsList[0] as CompressedObservation;
+    const raw: RawObservation = {
+      id: stored.id,
+      sessionId: stored.sessionId,
+      timestamp: stored.timestamp,
+      hookType: stored.sourceHookType ?? "post_tool_use",
+      toolName: stored.sourceToolName ?? "screenshot",
+      raw: {},
+      modality: stored.modality,
+      imageData: stored.imageData,
+    };
 
     expect(raw.modality).toBeDefined();
     expect(raw.imageData).toBe(savedImagePath);
@@ -160,11 +170,13 @@ describe("End-to-End Multimodal Flow", () => {
     expect(compressed.modality).toBe("mixed");
     expect(compressed.title).toBe("Screenshot of Red Dot");
     expect(compressed.narrative).toContain("red dot");
+    expect(compressed.sourceHookType).toBe("post_tool_use");
+    expect(compressed.sourceToolName).toBe("screenshot");
 
-    const stored = await kv.get("mem:obs:test-session", raw.id!) as CompressedObservation | null;
-    expect(stored).not.toBeNull();
-    expect(stored!.imageDescription).toBe("TEST_VISION_RESULT: I see a red dot");
-    expect(stored!.imageRef).toBe(savedImagePath);
+    const persisted = await kv.get("mem:obs:test-session", raw.id!) as CompressedObservation | null;
+    expect(persisted).not.toBeNull();
+    expect(persisted!.imageDescription).toBe("TEST_VISION_RESULT: I see a red dot");
+    expect(persisted!.imageRef).toBe(savedImagePath);
     expect(scheduleIndexSave).toHaveBeenCalledTimes(1);
   });
 });

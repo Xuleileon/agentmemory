@@ -218,4 +218,81 @@ describe("HybridSearch", () => {
     expect(results[0].bm25Score).toBe(2);
     expect(results[0].vectorScore).toBe(0.95);
   });
+
+  it("filters self-search telemetry and replenishes the requested result limit", async () => {
+    const telemetry = makeObs({
+      id: "obs_telemetry",
+      sessionId: "ses_meta",
+      type: "search",
+      title: "Memory recall for mouse stuttering and task manager freeze",
+      facts: ["Tool used: mcp__agentmemory__memory_recall"],
+      narrative: "The agent queried its memory for mouse stuttering.",
+      concepts: ["memory recall"],
+      importance: 2,
+    });
+    const prompt = makeObs({
+      id: "obs_prompt",
+      sessionId: "ses_prompt",
+      type: "conversation",
+      title: "prompt_submit",
+      narrative: "mouse stuttering task manager freeze",
+      sourceHookType: "prompt_submit",
+    });
+    const glob = makeObs({
+      id: "obs_glob",
+      sessionId: "ses_glob",
+      type: "search",
+      title: "Glob",
+      narrative: '{"pattern":"*mouse*","path":"C:/work"}',
+      sourceHookType: "post_tool_use",
+      sourceToolName: "Glob",
+    });
+    await kv.set("mem:obs:ses_meta", telemetry.id, telemetry);
+    await kv.set("mem:obs:ses_prompt", prompt.id, prompt);
+    await kv.set("mem:obs:ses_glob", glob.id, glob);
+    await kv.set("mem:memories", "mem_diagnosis", {
+      id: "mem_diagnosis",
+      createdAt: "2026-07-12T05:17:16.936Z",
+      updatedAt: "2026-07-12T05:17:16.936Z",
+      type: "bug",
+      title: "Windows 鼠标卡顿与任务管理器死机深度诊断",
+      content: "A runaway background process saturated CPU scheduling.",
+      concepts: ["mouse stuttering", "task manager freeze"],
+      files: [],
+      sessionIds: [],
+      strength: 9,
+      version: 1,
+      isLatest: true,
+    });
+
+    const backend = {
+      lexicalSearch: async () => [
+        { obsId: telemetry.id, sessionId: telemetry.sessionId, score: 10 },
+        { obsId: prompt.id, sessionId: prompt.sessionId, score: 9 },
+        { obsId: "mem_diagnosis", sessionId: "memory", score: 8 },
+        { obsId: glob.id, sessionId: glob.sessionId, score: 7 },
+      ],
+      vectorSearch: async () => [],
+    } as Pick<SearchBackend, "lexicalSearch" | "vectorSearch">;
+    const hybrid = new HybridSearch(
+      bm25,
+      null,
+      null,
+      kv as never,
+      0.4,
+      0.6,
+      0,
+      false,
+      backend,
+    );
+
+    const results = await hybrid.search("鼠标卡顿", 2);
+
+    expect(results).toHaveLength(2);
+    expect(results[0].observation.id).toBe("mem_diagnosis");
+    expect(results.map((result) => result.observation.id)).toContain("obs_glob");
+    expect(results.map((result) => result.observation.id)).not.toContain(
+      "obs_telemetry",
+    );
+  });
 });
