@@ -2,12 +2,14 @@
   "mcpServers": {
     "agentmemory": {
       "type": "local",
-      "command": "npx",
-      "args": ["-y", "@agentmemory/mcp"],
+      "command": "node",
+      "args": ["E:\\agentmemory\\dist\\standalone.mjs"],
       "env": {
         "AGENTMEMORY_URL": "${AGENTMEMORY_URL:-http://localhost:3111}",
         "AGENTMEMORY_SECRET": "${AGENTMEMORY_SECRET:-}",
-        "AGENTMEMORY_TOOLS": "${AGENTMEMORY_TOOLS:-all}"
+        "AGENTMEMORY_TOOLS": "${AGENTMEMORY_TOOLS:-all}",
+        "AGENTMEMORY_FORCE_PROXY": "1",
+        "AGENTMEMORY_CALL_TIMEOUT_MS": "120000"
       },
       "tools": ["*"]
     }

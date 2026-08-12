@@ -6,7 +6,8 @@ import {
   copyFileSync,
   renameSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 
@@ -22,37 +23,51 @@ import * as p from "@clack/prompts";
 // tools). One wired entry now serves local AND remote (Kubernetes /
 // reverse-proxied) deployments without doctor-warning duplicates (#375)
 // AND fresh installs that haven't exported envs (#510).
+function inferStandaloneEntrypoint(): string {
+  const override = process.env["AGENTMEMORY_MCP_ENTRYPOINT"]?.trim();
+  if (override) return resolve(override);
+
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  if (moduleDir.replace(/\\/g, "/").endsWith("/src/cli/connect")) {
+    return resolve(moduleDir, "../../../dist/standalone.mjs");
+  }
+  return resolve(moduleDir, "standalone.mjs");
+}
+
+export const AGENTMEMORY_LOCAL_MCP_PATH = inferStandaloneEntrypoint();
+
 export const AGENTMEMORY_MCP_BLOCK = {
-  command: "npx",
-  args: ["-y", "@agentmemory/mcp"],
+  command: "node",
+  args: [AGENTMEMORY_LOCAL_MCP_PATH],
   env: {
     AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
     AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
     AGENTMEMORY_TOOLS: "${AGENTMEMORY_TOOLS:-all}",
+    AGENTMEMORY_FORCE_PROXY: "1",
+    AGENTMEMORY_CALL_TIMEOUT_MS: "120000",
   },
 };
-
-const COPILOT_MCP_COMMAND =
-  process.platform === "win32"
-    ? {
-        command: process.env["ComSpec"] || process.env["COMSPEC"] || "cmd.exe",
-        args: ["/d", "/s", "/c", "npx", "-y", "@agentmemory/mcp"],
-      }
-    : {
-        command: "npx",
-        args: ["-y", "@agentmemory/mcp"],
-      };
 
 export const AGENTMEMORY_COPILOT_MCP_BLOCK = {
   type: "local" as const,
-  ...COPILOT_MCP_COMMAND,
-  env: {
-    AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
-    AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
-    AGENTMEMORY_TOOLS: "${AGENTMEMORY_TOOLS:-all}",
-  },
+  ...AGENTMEMORY_MCP_BLOCK,
   tools: ["*"],
 };
+
+export function isLocalForkMcpEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const candidate = entry as Record<string, unknown>;
+  const command = candidate["command"];
+  const args = candidate["args"];
+  return (
+    typeof command === "string" &&
+    /(?:^|[\\/])node(?:\.exe)?$/i.test(command) &&
+    Array.isArray(args) &&
+    args.length === 1 &&
+    typeof args[0] === "string" &&
+    /(?:^|[\\/])dist[\\/]standalone\.mjs$/i.test(args[0])
+  );
+}
 
 export function backupsDir(): string {
   return join(homedir(), ".agentmemory", "backups");

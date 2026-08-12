@@ -112,13 +112,15 @@ describe("Copilot MCP config (.mcp.copilot.json)", () => {
     }>(mcpPath);
     const server = config.mcpServers.agentmemory;
     expect(server.type).toBe("local");
-    expect(server.command).toBe("npx");
-    expect(server.args).toEqual(["-y", "@agentmemory/mcp"]);
+    expect(server.command).toBe("node");
+    expect(server.args).toEqual(["E:\\agentmemory\\dist\\standalone.mjs"]);
     expect(server.env["AGENTMEMORY_URL"]).toBe(
       "${AGENTMEMORY_URL:-http://localhost:3111}",
     );
     expect(server.env["AGENTMEMORY_SECRET"]).toBe("${AGENTMEMORY_SECRET:-}");
     expect(server.env["AGENTMEMORY_TOOLS"]).toBe("${AGENTMEMORY_TOOLS:-all}");
+    expect(server.env["AGENTMEMORY_FORCE_PROXY"]).toBe("1");
+    expect(server.env["AGENTMEMORY_CALL_TIMEOUT_MS"]).toBe("120000");
     expect(server.tools).toContain("*");
   });
 });

@@ -1,4 +1,3 @@
-import { platform } from "node:os";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
@@ -21,6 +20,7 @@ import { adapter as openhuman } from "./openhuman.js";
 import { adapter as pi } from "./pi.js";
 import { adapter as qwen } from "./qwen.js";
 import { adapter as warp } from "./warp.js";
+import { adapter as windsurf } from "./windsurf.js";
 import { adapter as zed } from "./zed.js";
 
 export const ADAPTERS: readonly ConnectAdapter[] = [
@@ -30,6 +30,7 @@ export const ADAPTERS: readonly ConnectAdapter[] = [
   cursor,
   geminiCli,
   qwen,
+  windsurf,
   antigravity,
   antigravityCli,
   kiro,
@@ -132,17 +133,6 @@ export async function runAdapter(
 export async function runConnect(args: string[]): Promise<void> {
   const { dryRun, force, all, withHooks, guidelines, positional } =
     parseFlags(args);
-  const allowWindowsAdapter =
-    positional.length === 1 && positional[0]?.toLowerCase() === "copilot-cli";
-  if (platform() === "win32" && !allowWindowsAdapter) {
-    p.intro("agentmemory connect");
-    p.log.warn(
-      "Windows: automated `connect` is not supported yet. See https://github.com/rohitg00/agentmemory#other-agents for manual install steps.",
-    );
-    p.outro("Windows: manual install required — see docs");
-    return;
-  }
-
   const opts: ConnectOptions = { dryRun, force, withHooks, guidelines };
 
   p.intro("agentmemory connect");
@@ -234,7 +224,7 @@ function summarize(
   );
   if (wiredAny) {
     p.log.info(
-      "Next: install agentmemory's 15 skills into the same agent(s) so they know when to call the tools:\n  npx skills add rohitg00/agentmemory -y",
+      "Next: install this fork's 15 skills into the same agent(s) so they know when to call the tools:\n  npx skills add Xuleileon/agentmemory -y",
     );
   }
 

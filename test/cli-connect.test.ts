@@ -9,17 +9,15 @@ import {
   resolveAdapter,
 } from "../src/cli/connect/index.js";
 import type { ConnectAdapter } from "../src/cli/connect/types.js";
+import {
+  AGENTMEMORY_COPILOT_MCP_BLOCK,
+  isLocalForkMcpEntry,
+} from "../src/cli/connect/util.js";
 
-const EXPECTED_COPILOT_MCP_COMMAND =
-  process.platform === "win32"
-    ? {
-        command: process.env["ComSpec"] || process.env["COMSPEC"] || "cmd.exe",
-        args: ["/d", "/s", "/c", "npx", "-y", "@agentmemory/mcp"],
-      }
-    : {
-        command: "npx",
-        args: ["-y", "@agentmemory/mcp"],
-      };
+const EXPECTED_COPILOT_MCP_COMMAND = {
+  command: AGENTMEMORY_COPILOT_MCP_BLOCK.command,
+  args: AGENTMEMORY_COPILOT_MCP_BLOCK.args,
+};
 
 describe("agentmemory connect — dispatcher", () => {
   it("resolves every known agent by lowercase name", () => {
@@ -61,10 +59,11 @@ describe("agentmemory connect — dispatcher", () => {
         "pi",
         "qwen",
         "warp",
+        "windsurf",
         "zed",
       ].sort(),
     );
-    expect(ADAPTERS.length).toBe(19);
+    expect(ADAPTERS.length).toBe(20);
   });
 
   it("every adapter exposes detect() and install()", () => {
@@ -135,8 +134,7 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
     expect(first.kind).toBe("installed");
 
     const config = JSON.parse(readFileSync(join(tmpHome, ".claude.json"), "utf-8"));
-    expect(config.mcpServers.agentmemory.command).toBe("npx");
-    expect(config.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(isLocalForkMcpEntry(config.mcpServers.agentmemory)).toBe(true);
     expect(config.mcpServers.other.command).toBe("x");
 
     const second = await a.install({ dryRun: false, force: false });
@@ -270,7 +268,9 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
     const entry = config.mcp.agentmemory;
     expect(entry.type).toBe("local");
     expect(Array.isArray(entry.command)).toBe(true);
-    expect(entry.command).toContain("@agentmemory/mcp");
+    expect(
+      isLocalForkMcpEntry({ command: entry.command[0], args: entry.command.slice(1) }),
+    ).toBe(true);
     expect(entry.enabled).toBe(true);
     expect(config.mcp.other.command).toEqual(["x"]);
 
@@ -347,16 +347,9 @@ describe("agentmemory connect — copilot-cli adapter (mock filesystem)", () => 
     const config = JSON.parse(
       readFileSync(join(tmpHome, ".copilot", "mcp-config.json"), "utf-8"),
     );
-    expect(config.mcpServers.agentmemory).toEqual({
-      type: "local",
-      ...EXPECTED_COPILOT_MCP_COMMAND,
-      env: {
-        AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
-        AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
-        AGENTMEMORY_TOOLS: "${AGENTMEMORY_TOOLS:-all}",
-      },
-      tools: ["*"],
-    });
+    expect(config.mcpServers.agentmemory).toEqual(
+      AGENTMEMORY_COPILOT_MCP_BLOCK,
+    );
 
     const second = await a.install({ dryRun: false, force: false });
     expect(second.kind).toBe("already-wired");
@@ -483,11 +476,11 @@ describe("agentmemory connect — copilot-cli adapter (mock filesystem)", () => 
   });
 });
 
-describe("agentmemory connect — stub adapters log + return stub", () => {
-  it("hermes adapter returns stub regardless of detect", async () => {
+describe("agentmemory connect — manual and native-only adapters", () => {
+  it("hermes creates a local-fork config when no YAML needs merging", async () => {
     const { adapter } = await import("../src/cli/connect/hermes.js");
     const result = await adapter.install({ dryRun: false, force: false });
-    expect(result.kind).toBe("stub");
+    expect(["installed", "already-wired"]).toContain(result.kind);
   });
 
   it("openhuman adapter returns stub", async () => {

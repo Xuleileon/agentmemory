@@ -4,10 +4,12 @@ import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 import {
+  AGENTMEMORY_LOCAL_MCP_PATH,
   backupFile,
   logAlreadyWired,
   logBackup,
   logInstalled,
+  isLocalForkMcpEntry,
   readJsonSafe,
   writeJsonAtomic,
 } from "./util.js";
@@ -23,12 +25,15 @@ const DETECT_DIR = join(homedir(), ".config", "opencode");
 // No `environment` block: OpenCode does not expand shell-style
 // `${VAR:-default}` values, and writing them literally would override the
 // user's real shell AGENTMEMORY_URL with an unexpanded string. The stdio
-// child inherits the shell environment (an exported AGENTMEMORY_URL /
-// AGENTMEMORY_SECRET still reaches the server), and the @agentmemory/mcp
-// shim defaults unset vars (URL -> localhost:3111, no secret, all tools).
+// child inherits the shell environment. The local standalone entrypoint
+// defaults to localhost:3111 and stays version-locked to this installation.
 const OPENCODE_ENTRY = {
   type: "local",
-  command: ["npx", "-y", "@agentmemory/mcp"],
+  command: ["node", AGENTMEMORY_LOCAL_MCP_PATH],
+  environment: {
+    AGENTMEMORY_FORCE_PROXY: "1",
+    AGENTMEMORY_CALL_TIMEOUT_MS: "120000",
+  },
   enabled: true,
 };
 
@@ -38,7 +43,10 @@ type McpEntry = Record<string, unknown>;
 function entryMatches(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const command = (entry as McpEntry)["command"];
-  return Array.isArray(command) && command.includes("@agentmemory/mcp");
+  return (
+    Array.isArray(command) &&
+    isLocalForkMcpEntry({ command: command[0], args: command.slice(1) })
+  );
 }
 
 export const adapter: ConnectAdapter = {

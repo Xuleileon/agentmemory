@@ -9,6 +9,7 @@ import {
   logAlreadyWired,
   logBackup,
   logInstalled,
+  isLocalForkMcpEntry,
   readJsonSafe,
   writeJsonAtomic,
 } from "./util.js";
@@ -29,11 +30,7 @@ type ClaudeConfig = {
 };
 
 function entryMatches(entry: unknown): boolean {
-  if (!entry || typeof entry !== "object") return false;
-  const e = entry as Record<string, unknown>;
-  if (e["command"] !== "npx") return false;
-  const args = Array.isArray(e["args"]) ? (e["args"] as string[]) : [];
-  return args.includes("@agentmemory/mcp");
+  return isLocalForkMcpEntry(entry);
 }
 
 export const adapter: ConnectAdapter = {

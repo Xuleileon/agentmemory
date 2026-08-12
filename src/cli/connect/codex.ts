@@ -4,6 +4,7 @@ import { join, dirname } from "node:path";
 import * as p from "@clack/prompts";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 import {
+  AGENTMEMORY_LOCAL_MCP_PATH,
   backupFile,
   logAlreadyWired,
   logBackup,
@@ -21,18 +22,24 @@ const CODEX_DIR = join(homedir(), ".codex");
 const CODEX_TOML = join(CODEX_DIR, "config.toml");
 const CODEX_HOOKS = join(CODEX_DIR, "hooks.json");
 
+const escapedMcpPath = AGENTMEMORY_LOCAL_MCP_PATH.replace(/\\/g, "\\\\");
 const TOML_BLOCK = `[mcp_servers.agentmemory]
-command = "npx"
-args = ["-y", "@agentmemory/mcp"]
+command = "node"
+args = ["${escapedMcpPath}"]
 
 [mcp_servers.agentmemory.env]
 AGENTMEMORY_URL = "http://localhost:3111"
+AGENTMEMORY_FORCE_PROXY = "1"
+AGENTMEMORY_CALL_TIMEOUT_MS = "120000"
 `;
 
 const SECTION_HEADER = "[mcp_servers.agentmemory]";
 
 function isWiredText(toml: string): boolean {
-  return toml.includes(SECTION_HEADER);
+  return (
+    toml.includes(SECTION_HEADER) &&
+    /dist(?:\\\\+|\/+)+standalone\.mjs/i.test(toml)
+  );
 }
 
 function stripExistingBlock(toml: string): string {
@@ -76,6 +83,7 @@ export const adapter: ConnectAdapter = {
     const exists = existsSync(CODEX_TOML);
     const current = exists ? readFileSync(CODEX_TOML, "utf-8") : "";
     const wired = isWiredText(current);
+    const hasSection = current.includes(SECTION_HEADER);
 
     if (wired && !opts.force) {
       logAlreadyWired("Codex CLI", CODEX_TOML);
@@ -98,7 +106,7 @@ export const adapter: ConnectAdapter = {
       mkdirSync(dirname(CODEX_TOML), { recursive: true });
     }
 
-    const cleaned = wired ? stripExistingBlock(current) : current;
+    const cleaned = hasSection ? stripExistingBlock(current) : current;
     const joiner = cleaned.length === 0 || cleaned.endsWith("\n") ? "" : "\n";
     const next = `${cleaned}${joiner}${cleaned.length > 0 ? "\n" : ""}${TOML_BLOCK}`;
     writeFileSync(CODEX_TOML, next, "utf-8");
@@ -113,7 +121,7 @@ export const adapter: ConnectAdapter = {
 
     logInstalled("Codex CLI", CODEX_TOML);
     p.log.info(
-      "Codex picks up MCP servers on next launch. For the deeper plugin install, run: codex plugin marketplace add rohitg00/agentmemory && codex plugin add agentmemory@agentmemory",
+      "Codex picks up MCP servers on next launch. For the deeper plugin install, run: codex plugin marketplace add Xuleileon/agentmemory && codex plugin add agentmemory@agentmemory",
     );
 
     if (opts.withHooks) {

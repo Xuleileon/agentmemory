@@ -1,7 +1,10 @@
 param(
   [int]$ProbeIntervalSeconds = 5,
   [int]$FailureThreshold = 3,
-  [int]$StartupGraceSeconds = 180,
+  # A 200k-row file-backed store can legitimately take several minutes to
+  # initialize after a cold boot. Keep the supervisor from killing iii while
+  # it is still making forward progress toward opening the engine socket.
+  [int]$StartupGraceSeconds = 600,
   [int]$EnginePort = 49134,
   [string]$HealthUrl = 'http://127.0.0.1:3111/agentmemory/livez'
 )
@@ -20,6 +23,7 @@ $lockPath = Join-Path $runtimeRoot 'watchdog.lock'
 $healthUrl = $HealthUrl
 $workerPath = Join-Path $repoRoot 'dist\index.mjs'
 $workerCommandFragment = $workerPath.Replace('\', '/')
+$relativeWorkerPattern = '(?i)(?:^|\s)dist/index\.mjs(?:\s|$)'
 $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
 
 if (-not [System.IO.Path]::IsPathFullyQualified($repoRoot) -or
@@ -79,7 +83,10 @@ function Get-ManagedWorkers {
   return @(
     Get-CimInstance Win32_Process | Where-Object {
       $_.Name -eq 'node.exe' -and
-      ($_.CommandLine -replace '\\', '/') -like "*$workerCommandFragment*"
+      (
+        ($_.CommandLine -replace '\\', '/') -like "*$workerCommandFragment*" -or
+        ($_.CommandLine -replace '\\', '/') -match $relativeWorkerPattern
+      )
     }
   )
 }
@@ -160,27 +167,45 @@ function Start-ManagedStack {
   $env:RUST_LOG = 'warn'
   $process = Start-Process @startArgs
 
-  # Production supervision owns the worker explicitly. Relying on iii-exec
-  # alone leaves the REST engine alive with no AgentMemory routes when its
-  # child launch is missed; that produces an endless healthy-engine/404 loop.
-  # The file-backed state workers can take over a minute to initialize before
-  # iii opens its WebSocket listener. Starting Node earlier pushes the SDK into
-  # exponential reconnect backoff, making registration slow and nondeterministic.
+  # iii-exec is the canonical owner of the worker and is also what exposes the
+  # engine WebSocket. Starting Node before that socket exists pushes the SDK
+  # into exponential reconnect backoff, making registration nondeterministic.
   Wait-EngineReady -Process $process
 
-  $workerArgs = @{
-    FilePath = $nodePath
-    ArgumentList = @($workerPath)
-    WorkingDirectory = $repoRoot
-    WindowStyle = 'Hidden'
-    RedirectStandardOutput = $workerStdoutPath
-    RedirectStandardError = $workerStderrPath
-    PassThru = $true
+  # Adopt the iii-exec child when it appears. If iii-exec misses the launch,
+  # start exactly one supervised fallback rather than leaving a 404-only REST
+  # engine or creating duplicate workers.
+  $workerDeadline = (Get-Date).AddSeconds(30)
+  do {
+    $managedWorkers = @(Get-ManagedWorkers)
+    if ($managedWorkers.Count -gt 0) { break }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $workerDeadline)
+
+  if ($managedWorkers.Count -gt 1) {
+    throw "iii-exec launched duplicate workers: $($managedWorkers.Count)"
   }
-  $workerProcess = Start-Process @workerArgs
+
+  if ($managedWorkers.Count -eq 1) {
+    $workerPid = $managedWorkers[0].ProcessId
+    $workerMode = 'iii-exec'
+  } else {
+    $workerArgs = @{
+      FilePath = $nodePath
+      ArgumentList = @($workerPath)
+      WorkingDirectory = $repoRoot
+      WindowStyle = 'Hidden'
+      RedirectStandardOutput = $workerStdoutPath
+      RedirectStandardError = $workerStderrPath
+      PassThru = $true
+    }
+    $workerProcess = Start-Process @workerArgs
+    $workerPid = $workerProcess.Id
+    $workerMode = 'watchdog-fallback'
+  }
 
   Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding ascii
-  Write-WatchdogLog "started iii pid=$($process.Id) worker pid=$($workerProcess.Id) engine_stdout=$stdoutPath engine_stderr=$stderrPath worker_stdout=$workerStdoutPath worker_stderr=$workerStderrPath"
+  Write-WatchdogLog "started iii pid=$($process.Id) worker pid=$workerPid mode=$workerMode engine_stdout=$stdoutPath engine_stderr=$stderrPath worker_stdout=$workerStdoutPath worker_stderr=$workerStderrPath"
 }
 
 try {
