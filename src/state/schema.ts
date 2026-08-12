@@ -11,6 +11,7 @@ export const KV = {
   health: "mem:health",
   embeddings: (obsId: string) => `mem:emb:${obsId}`,
   bm25Index: "mem:index:bm25",
+  searchJournal: "mem:search-journal",
   relations: "mem:relations",
   profiles: "mem:profiles",
   claudeBridge: "mem:claude-bridge",

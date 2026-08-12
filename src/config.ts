@@ -228,6 +228,44 @@ export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
 }
 
+export type SearchBackendMode = "legacy" | "shadow" | "lance";
+
+export function getSearchBackendConfig(): {
+  mode: SearchBackendMode;
+  path: string;
+  batchSize: number;
+  batchMs: number;
+  buildOnStart: boolean;
+  buildVectorIndex: boolean;
+  legacyPersistence: "auto" | "manual";
+} {
+  const env = getMergedEnv();
+  const rawMode = env["AGENTMEMORY_SEARCH_BACKEND"];
+  const mode: SearchBackendMode =
+    rawMode === "shadow" || rawMode === "lance" ? rawMode : "legacy";
+  return {
+    mode,
+    path:
+      env["AGENTMEMORY_LANCE_PATH"] ||
+      join(homedir(), ".agentmemory", "data", "search.lance"),
+    batchSize: Math.max(
+      1,
+      safeParseInt(env["AGENTMEMORY_SEARCH_BATCH_SIZE"], 100),
+    ),
+    batchMs: Math.max(
+      1,
+      safeParseInt(env["AGENTMEMORY_SEARCH_BATCH_MS"], 250),
+    ),
+    buildOnStart: env["AGENTMEMORY_SEARCH_BUILD_ON_START"] === "true",
+    buildVectorIndex:
+      env["AGENTMEMORY_LANCE_BUILD_VECTOR_INDEX"] !== "false",
+    legacyPersistence:
+      env["AGENTMEMORY_LEGACY_INDEX_PERSISTENCE"] === "manual"
+        ? "manual"
+        : "auto",
+  };
+}
+
 export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }

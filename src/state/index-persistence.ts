@@ -30,6 +30,7 @@ type IndexShardManifest = {
 type IndexPersistenceOptions = {
   shardChars?: number;
   createGeneration?: () => string;
+  autoSave?: boolean;
 };
 
 export interface IndexPersistenceStatus {
@@ -103,6 +104,7 @@ export class IndexPersistence {
 
   scheduleSave(): void {
     this.dirtyGeneration++;
+    if (this.options.autoSave === false) return;
     if (this.timer) clearTimeout(this.timer);
     // setTimeout discards the returned promise, so any rejection inside
     // save() would surface as unhandledRejection and crash the process

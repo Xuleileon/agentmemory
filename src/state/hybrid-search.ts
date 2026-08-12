@@ -16,6 +16,7 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import type { SearchBackend } from "./search-backend.js";
 
 const RRF_K = 60;
 
@@ -31,6 +32,10 @@ export class HybridSearch {
     private vectorWeight = 0.6,
     private graphWeight = 0.3,
     private rerankEnabled = process.env.RERANK_ENABLED === "true",
+    private searchBackend?: Pick<
+      SearchBackend,
+      "lexicalSearch" | "vectorSearch"
+    >,
   ) {
     this.graphRetrieval = new GraphRetrieval(kv);
   }
@@ -79,7 +84,9 @@ export class HybridSearch {
     limit: number,
     entityHints?: string[],
   ): Promise<HybridSearchResult[]> {
-    const bm25Results = this.bm25.search(query, limit * 2);
+    const bm25Results = this.searchBackend
+      ? await this.searchBackend.lexicalSearch(query, limit * 2)
+      : this.bm25.search(query, limit * 2);
 
     let vectorResults: Array<{
       obsId: string;
@@ -88,7 +95,17 @@ export class HybridSearch {
     }> = [];
     let queryEmbedding: Float32Array | null = null;
 
-    if (this.vector && this.embeddingProvider && this.vector.size > 0) {
+    if (this.searchBackend && this.embeddingProvider) {
+      try {
+        queryEmbedding = await this.embeddingProvider.embed(query);
+        vectorResults = await this.searchBackend.vectorSearch(
+          queryEmbedding,
+          limit * 2,
+        );
+      } catch {
+        // fall through to lexical-only
+      }
+    } else if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
         vectorResults = this.vector.search(queryEmbedding, limit * 2);

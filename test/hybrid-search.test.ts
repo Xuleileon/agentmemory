@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
+import type { SearchBackend } from "../src/state/search-backend.js";
 
 function makeObs(
   overrides: Partial<CompressedObservation> = {},
@@ -179,5 +180,42 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("mem_abc");
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
+  });
+
+  it("uses the disk-backed search backend without touching legacy indexes", async () => {
+    const obs = makeObs({ id: "obs_lance", sessionId: "ses_lance" });
+    await kv.set("mem:obs:ses_lance", "obs_lance", obs);
+    const backend = {
+      lexicalSearch: async () => [
+        { obsId: "obs_lance", sessionId: "ses_lance", score: 2 },
+      ],
+      vectorSearch: async () => [
+        { obsId: "obs_lance", sessionId: "ses_lance", score: 0.95 },
+      ],
+    } as Pick<SearchBackend, "lexicalSearch" | "vectorSearch">;
+    const provider: EmbeddingProvider = {
+      name: "test",
+      dimensions: 2,
+      embed: async () => new Float32Array([1, 0]),
+      embedBatch: async () => [new Float32Array([1, 0])],
+    };
+    const hybrid = new HybridSearch(
+      bm25,
+      null,
+      provider,
+      kv as never,
+      0.4,
+      0.6,
+      0,
+      false,
+      backend,
+    );
+
+    const results = await hybrid.search("auth middleware");
+
+    expect(results).toHaveLength(1);
+    expect(results[0].observation.id).toBe("obs_lance");
+    expect(results[0].bm25Score).toBe(2);
+    expect(results[0].vectorScore).toBe(0.95);
   });
 });

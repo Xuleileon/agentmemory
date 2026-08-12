@@ -204,16 +204,39 @@ export interface HealthSnapshot {
   memory: {
     heapUsed: number;
     heapTotal: number;
+    heapLimit?: number;
     rss: number;
+    hostTotal?: number;
     external: number;
   };
-  cpu: { userMicros: number; systemMicros: number; percent: number };
+  cpu: {
+    userMicros: number;
+    systemMicros: number;
+    percent: number;
+    processCorePercent?: number;
+    logicalProcessors?: number;
+  };
   eventLoopLagMs: number;
   uptimeSeconds: number;
   kvConnectivity?: { status: string; latencyMs?: number; error?: string };
   status: "healthy" | "degraded" | "critical";
   alerts: string[];
   notes?: string[];
+}
+
+export interface SearchJournalEntry {
+  id: string;
+  operation: "upsert" | "delete";
+  createdAt: string;
+  record?: {
+    id: string;
+    sessionId: string;
+    updatedAt: string;
+    project?: string;
+    agentId?: string;
+    kind?: "memory" | "observation" | "synthetic";
+    sourceVersion?: number;
+  };
 }
 
 export interface CircuitBreakerState {

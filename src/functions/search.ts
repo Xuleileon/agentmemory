@@ -9,10 +9,14 @@ import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import type { SearchProjection } from "../state/search-projection.js";
+import type { SearchRecord } from "../state/search-backend.js";
+import type { SearchBackend } from "../state/search-backend.js";
 
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
 let currentEmbeddingProvider: EmbeddingProvider | null = null
+let searchProjection: SearchProjection | null = null
 
 // Dedupes the lazy cold-start rebuild kicked off from the mem::search
 // request path. A full rebuildIndex walks every observation across every
@@ -44,8 +48,28 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
 }
 
+export function setSearchProjection(projection: SearchProjection | null): void {
+  searchProjection = projection
+}
+
+export async function prepareSearchUpsert(
+  metadata: Omit<SearchRecord, "text" | "vector">,
+): Promise<void> {
+  await searchProjection?.prepareUpsert(metadata)
+}
+
+export async function prepareSearchDelete(id: string): Promise<void> {
+  await searchProjection?.prepareDelete(id)
+}
+
 export function vectorIndexRemove(id: string): void {
   vectorIndex?.remove(id);
+  void searchProjection?.enqueueDelete(id).catch((err) => {
+    logger.warn("search projection delete enqueue failed", {
+      id,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  });
 }
 
 // Persistence sync hook. Without this, index removals only live in
@@ -108,7 +132,7 @@ export async function vectorIndexAddGuarded(
 ): Promise<boolean> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
-  if (!vi || !ep) return false
+  if ((!vi && !searchProjection) || !ep) return false
   try {
     const embedding = await ep.embed(clipEmbedInput(text))
     if (embedding.length !== ep.dimensions) {
@@ -121,7 +145,17 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    vi?.add(id, sessionId, embedding)
+    const now = new Date().toISOString()
+    const projectionRecord: SearchRecord = {
+      id,
+      sessionId,
+      text: clipEmbedInput(text),
+      vector: embedding,
+      updatedAt: now,
+      kind: context.kind,
+    }
+    await searchProjection?.enqueueUpsert(projectionRecord)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -154,7 +188,9 @@ export async function vectorIndexAddBatchGuarded(
 ): Promise<{ ok: number; fail: number }> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
-  if (!vi || !ep || items.length === 0) return { ok: 0, fail: 0 }
+  if ((!vi && !searchProjection) || !ep || items.length === 0) {
+    return { ok: 0, fail: 0 }
+  }
 
   let embeddings: Float32Array[]
   try {
@@ -197,7 +233,15 @@ export async function vectorIndexAddBatchGuarded(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
+      vi?.add(item.id, item.sessionId, embedding)
+      await searchProjection?.enqueueUpsert({
+        id: item.id,
+        sessionId: item.sessionId,
+        text: clipEmbedInput(item.text),
+        vector: embedding,
+        updatedAt: new Date().toISOString(),
+        kind: item.context.kind,
+      })
       ok++
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
@@ -393,6 +437,48 @@ export async function indexRecords(
     vector: vectorIndex,
     embeddingProvider: currentEmbeddingProvider,
   })
+  if (searchProjection && currentEmbeddingProvider) {
+    const candidates = [
+      ...memories
+        .filter((memory) => memory.isLatest !== false && memory.title && memory.content)
+        .map((memory) => ({
+          id: memory.id,
+          sessionId: memory.sessionIds?.[0] ?? "memory",
+          text: `${memory.title} ${memory.content}`,
+          updatedAt: memory.updatedAt || memory.createdAt,
+          ...(memory.project ? { project: memory.project } : {}),
+          ...(memory.agentId ? { agentId: memory.agentId } : {}),
+          kind: "memory" as const,
+          sourceVersion: memory.version,
+        })),
+      ...observations
+        .filter((observation) => observation.title && observation.narrative)
+        .map((observation) => ({
+          id: observation.id,
+          sessionId: observation.sessionId,
+          text: `${observation.title} ${observation.narrative}`,
+          updatedAt: observation.timestamp,
+          ...(observation.agentId ? { agentId: observation.agentId } : {}),
+          kind: "observation" as const,
+        })),
+    ]
+    for (let offset = 0; offset < candidates.length; offset += 32) {
+      const chunk = candidates.slice(offset, offset + 32)
+      const missing = chunk.filter((item) => !vectorIndex?.get(item.id))
+      const generated = missing.length > 0
+        ? await currentEmbeddingProvider.embedBatch(
+            missing.map((item) => clipEmbedInput(item.text)),
+          )
+        : []
+      let generatedIndex = 0
+      for (const item of chunk) {
+        const vector =
+          vectorIndex?.get(item.id)?.embedding ?? generated[generatedIndex++]
+        if (!vector || vector.length !== currentEmbeddingProvider.dimensions) continue
+        await searchProjection.enqueueUpsert({ ...item, vector })
+      }
+    }
+  }
   return result.indexed
 }
 
@@ -453,6 +539,7 @@ export function registerSearchFunction(
   sdk: ISdk,
   kv: StateKV,
   rebuildSearchIndex: () => Promise<number> = () => rebuildIndex(kv),
+  searchBackend?: Pick<SearchBackend, "lexicalSearch">,
 ): void {
   sdk.registerFunction(
     'mem::search',
@@ -530,7 +617,7 @@ export function registerSearchFunction(
         tokenBudget = data.token_budget
       }
 
-      if (idx.size === 0) {
+      if (!searchBackend && idx.size === 0) {
         // Share one rebuild across concurrent cold-start queries so they
         // don't each walk the whole corpus and saturate the pool.
         if (!rebuildPromise) {
@@ -561,7 +648,9 @@ export function registerSearchFunction(
       // rank lower than cross-agent ones in the hybrid score.
       const filtering = !!(projectFilter || cwdFilter || filterAgentId)
       const fetchLimit = filtering ? Math.max(effectiveLimit * 10, 100) : effectiveLimit
-      const results = idx.search(query, fetchLimit)
+      const results = searchBackend
+        ? await searchBackend.lexicalSearch(query, fetchLimit)
+        : idx.search(query, fetchLimit)
 
       // Resolve session -> project/cwd once per sessionId we touch.
       const sessionCache = new Map<string, Session | null>()

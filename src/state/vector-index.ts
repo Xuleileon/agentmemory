@@ -46,6 +46,12 @@ export class VectorIndex {
     return this.vectors.has(obsId);
   }
 
+  get(
+    obsId: string,
+  ): { embedding: Float32Array; sessionId: string } | undefined {
+    return this.vectors.get(obsId);
+  }
+
   remove(obsId: string): void {
     this.vectors.delete(obsId);
   }

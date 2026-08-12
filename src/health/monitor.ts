@@ -1,8 +1,10 @@
 import type { ISdk } from "iii-sdk";
+import { availableParallelism, totalmem } from "node:os";
+import { getHeapStatistics } from "node:v8";
 import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import { evaluateHealth } from "./thresholds.js";
+import { evaluateHealth, normalizeProcessCpuPercent } from "./thresholds.js";
 
 export function registerHealthMonitor(
   sdk: ISdk,
@@ -27,8 +29,13 @@ export function registerHealthMonitor(
     const elapsedMs = now - prevCpuTime;
     const userDelta = currentCpu.user - prevCpuUsage.user;
     const systemDelta = currentCpu.system - prevCpuUsage.system;
-    const cpuPercent =
+    const processCorePercent =
       elapsedMs > 0 ? ((userDelta + systemDelta) / 1000 / elapsedMs) * 100 : 0;
+    const logicalProcessors = availableParallelism();
+    const cpuPercent = normalizeProcessCpuPercent(
+      processCorePercent,
+      logicalProcessors,
+    );
     prevCpuUsage = currentCpu;
     prevCpuTime = now;
 
@@ -69,13 +76,17 @@ export function registerHealthMonitor(
       memory: {
         heapUsed: mem.heapUsed,
         heapTotal: mem.heapTotal,
+        heapLimit: getHeapStatistics().heap_size_limit,
         rss: mem.rss,
+        hostTotal: totalmem(),
         external: mem.external,
       },
       cpu: {
         userMicros: currentCpu.user,
         systemMicros: currentCpu.system,
         percent: Math.round(cpuPercent * 100) / 100,
+        processCorePercent: Math.round(processCorePercent * 100) / 100,
+        logicalProcessors,
       },
       eventLoopLagMs,
       uptimeSeconds: uptime,

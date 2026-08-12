@@ -28,6 +28,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     resetHandleForTests();
     globalThis.fetch = originalFetch;
     delete process.env["AGENTMEMORY_URL"];
+    delete process.env["AGENTMEMORY_CALL_TIMEOUT_MS"];
   });
 
   it("proxies memory_sessions to GET /agentmemory/sessions when server is up", async () => {
@@ -76,6 +77,47 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(body.query).toBe("auth bug");
     expect(body.results[0].id).toBe("m1");
     expect(receivedBody?.project).toBe("my-project");
+  });
+
+  it("does not turn a failed production search into an empty local result", async () => {
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/smart-search")) {
+        throw new Error("upstream search timed out");
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await expect(
+      handleToolCall("memory_smart_search", {
+        query: "自动切换 手机 竖屏 Mac 横屏 远程 显示 脚本",
+        limit: 5,
+      }),
+    ).rejects.toThrow(/upstream search timed out/);
+  });
+
+  it("uses the configured call timeout for long multi-word searches", async () => {
+    process.env["AGENTMEMORY_CALL_TIMEOUT_MS"] = "25";
+    let searchSignal: AbortSignal | undefined;
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/smart-search")) {
+        searchSignal = init?.signal ?? undefined;
+        return new Response(JSON.stringify({ results: [{ id: "m1" }] }), {
+          status: 200,
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const result = await handleToolCall("memory_smart_search", {
+      query: "vector index persistence incremental checkpoint",
+      limit: 5,
+    });
+
+    expect(JSON.parse(result.content[0].text).results).toHaveLength(1);
+    expect(searchSignal).toBeDefined();
+    expect(searchSignal?.aborted).toBe(false);
   });
 
   it("forwards all index maintenance tools through the full MCP proxy", async () => {

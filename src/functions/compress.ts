@@ -19,6 +19,7 @@ import {
   getSearchIndex,
   vectorIndexAddGuarded,
   scheduleIndexSave,
+  prepareSearchUpsert,
 } from "./search.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
@@ -172,6 +173,13 @@ export function registerCompressFunction(
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
         };
 
+        await prepareSearchUpsert({
+          id: compressed.id,
+          sessionId: compressed.sessionId,
+          updatedAt: compressed.timestamp,
+          ...(compressed.agentId ? { agentId: compressed.agentId } : {}),
+          kind: "observation",
+        });
         await kv.set(
           KV.observations(data.sessionId),
           data.observationId,

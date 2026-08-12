@@ -20,6 +20,19 @@ const DEFAULTS: ThresholdConfig = {
   memoryRssFloorBytes: 512 * 1024 * 1024,
 };
 
+export function normalizeProcessCpuPercent(
+  processCorePercent: number,
+  logicalProcessors: number,
+): number {
+  const safePercent = Number.isFinite(processCorePercent)
+    ? Math.max(0, processCorePercent)
+    : 0;
+  const divisor = Number.isFinite(logicalProcessors) && logicalProcessors > 0
+    ? logicalProcessors
+    : 1;
+  return Math.min(100, safePercent / divisor);
+}
+
 export function evaluateHealth(
   snapshot: HealthSnapshot,
   config: Partial<ThresholdConfig> = {},
@@ -59,9 +72,10 @@ export function evaluateHealth(
     degraded = true;
   }
 
+  const heapCapacity = snapshot.memory.heapLimit ?? snapshot.memory.heapTotal;
   const memPercent =
-    snapshot.memory.heapTotal > 0
-      ? (snapshot.memory.heapUsed / snapshot.memory.heapTotal) * 100
+    heapCapacity > 0
+      ? (snapshot.memory.heapUsed / heapCapacity) * 100
       : 0;
   const rss = snapshot.memory.rss ?? 0;
   const rssAboveFloor = rss >= cfg.memoryRssFloorBytes;

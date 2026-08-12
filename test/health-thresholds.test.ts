@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { evaluateHealth } from "../src/health/thresholds.js";
+import {
+  evaluateHealth,
+  normalizeProcessCpuPercent,
+} from "../src/health/thresholds.js";
 import type { HealthSnapshot } from "../src/types.js";
 
 function snap(over: Partial<HealthSnapshot> = {}): HealthSnapshot {
@@ -18,6 +21,21 @@ function snap(over: Partial<HealthSnapshot> = {}): HealthSnapshot {
 }
 
 describe("evaluateHealth memory severity", () => {
+  it("uses the V8 heap limit instead of the currently committed heap size", () => {
+    const s = snap({
+      memory: {
+        heapUsed: 850 * 1024 * 1024,
+        heapTotal: 900 * 1024 * 1024,
+        heapLimit: 4 * 1024 * 1024 * 1024,
+        rss: 1200 * 1024 * 1024,
+        external: 0,
+      },
+    });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("healthy");
+    expect(alerts.some((a) => a.startsWith("memory_"))).toBe(false);
+  });
+
   it("stays healthy when heap fills a tiny steady-state process (issue #158)", () => {
     const s = snap({
       memory: {
@@ -93,5 +111,17 @@ describe("evaluateHealth memory severity", () => {
     expect(loose.status).toBe("critical");
     const strict = evaluateHealth(s, { memoryRssFloorBytes: 1024 * 1024 * 1024 });
     expect(strict.status).toBe("healthy");
+  });
+});
+
+describe("normalizeProcessCpuPercent", () => {
+  it("reports one saturated core as a fraction of the host", () => {
+    expect(normalizeProcessCpuPercent(100, 24)).toBeCloseTo(4.17, 2);
+  });
+
+  it("caps malformed or oversubscribed samples at 100 percent", () => {
+    expect(normalizeProcessCpuPercent(3000, 24)).toBe(100);
+    expect(normalizeProcessCpuPercent(-1, 24)).toBe(0);
+    expect(normalizeProcessCpuPercent(100, 0)).toBe(100);
   });
 });

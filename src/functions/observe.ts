@@ -11,6 +11,7 @@ import {
   getSearchIndex,
   vectorIndexAddGuarded,
   scheduleIndexSave,
+  prepareSearchUpsert,
 } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -300,6 +301,13 @@ export function registerObserveFunction(
           });
         } else {
           const synthetic = buildSyntheticCompression(raw);
+          await prepareSearchUpsert({
+            id: synthetic.id,
+            sessionId: synthetic.sessionId,
+            updatedAt: synthetic.timestamp,
+            ...(synthetic.agentId ? { agentId: synthetic.agentId } : {}),
+            kind: "synthetic",
+          });
           await kv.set(
             KV.observations(payload.sessionId),
             obsId,

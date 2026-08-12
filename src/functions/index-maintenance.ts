@@ -13,6 +13,9 @@ import type { IndexPersistenceStatus } from "../state/index-persistence.js";
 import { indexRecordsInto } from "./search.js";
 import { logger } from "../logger.js";
 import { memoryToObservation } from "../state/memory-utils.js";
+import type { LanceSearchBackend } from "../state/lance-search-backend.js";
+import type { SearchProjection } from "../state/search-projection.js";
+import { clipEmbedInput } from "./search.js";
 
 export interface IndexRebuildResult {
   success: boolean;
@@ -40,6 +43,12 @@ export interface IndexMaintenanceOptions {
     save: () => Promise<void>;
     getStatus: () => PersistenceStatus;
   };
+  lance?: {
+    backend: LanceSearchBackend;
+    projection: SearchProjection;
+    buildVectorIndex: boolean;
+  };
+  legacyMaintenanceEnabled?: boolean;
 }
 
 export interface IndexMaintenanceController {
@@ -49,7 +58,18 @@ export interface IndexMaintenanceController {
   repair: (data?: IndexRepairOptions) => Promise<IndexRepairResult>;
   startRepair: (data?: IndexRepairOptions) => IndexRepairStartResult;
   getRepairStatus: () => IndexRepairJobStatus;
+  buildLance: () => Promise<LanceBuildStatus>;
 }
+
+type LanceBuildStatus = {
+  state: "idle" | "running" | "succeeded" | "failed";
+  startedAt?: string;
+  finishedAt?: string;
+  scanned?: number;
+  indexed?: number;
+  failed?: number;
+  error?: string;
+};
 
 export type IndexRebuildState = "idle" | "running" | "succeeded" | "failed";
 
@@ -490,8 +510,192 @@ export function registerIndexMaintenanceFunctions(
   let rebuildStatus: IndexRebuildJobStatus = { state: "idle" };
   let repairPromise: Promise<IndexRepairResult> | null = null;
   let repairStatus: IndexRepairJobStatus = { state: "idle" };
+  let lanceBuildPromise: Promise<LanceBuildStatus> | null = null;
+  let lanceBuildStatus: LanceBuildStatus = { state: "idle" };
+
+  const buildLance = (): Promise<LanceBuildStatus> => {
+    if (!options.lance) {
+      return Promise.resolve({
+        state: "failed",
+        error: "Lance search backend is not configured",
+      });
+    }
+    if (lanceBuildPromise) return lanceBuildPromise;
+    const startedAt = new Date().toISOString();
+    lanceBuildStatus = {
+      state: "running",
+      startedAt,
+      scanned: 0,
+      indexed: 0,
+      failed: 0,
+    };
+    const task = async (): Promise<LanceBuildStatus> => {
+      const lance = options.lance!;
+      lance.projection.beginBuild();
+      let scanned = 0;
+      let indexed = 0;
+      let failed = 0;
+      const append = async (
+        records: Array<{
+          id: string;
+          sessionId: string;
+          text: string;
+          updatedAt: string;
+          project?: string;
+          agentId?: string;
+          kind: "memory" | "observation";
+          sourceVersion?: number;
+          vector?: Float32Array;
+        }>,
+      ): Promise<void> => {
+        if (records.length === 0 || !options.embeddingProvider) return;
+        const missing = records.filter((record) => !record.vector);
+        const embedded = missing.length > 0
+          ? await options.embeddingProvider.embedBatch(
+              missing.map((record) => clipEmbedInput(record.text)),
+            )
+          : [];
+        if (embedded.length !== missing.length) {
+          throw new Error(
+            `embedding provider returned ${embedded.length} vectors for ` +
+              `${missing.length} records`,
+          );
+        }
+        let embeddedIndex = 0;
+        const valid = records.flatMap((record) => {
+          const vector = record.vector ?? embedded[embeddedIndex++];
+          if (vector.length !== options.embeddingProvider!.dimensions) {
+            failed++;
+            return [];
+          }
+          return [{ ...record, vector }];
+        });
+        await lance.backend.appendBatch(valid);
+        indexed += valid.length;
+        lanceBuildStatus = {
+          ...lanceBuildStatus,
+          scanned,
+          indexed,
+          failed,
+        };
+      };
+
+      try {
+        if (!options.embeddingProvider) {
+          throw new Error("embedding provider is not configured");
+        }
+        await lance.backend.reset();
+        const memories = await kv.list<Memory>(KV.memories);
+        for (let offset = 0; offset < memories.length; offset += 1000) {
+          const chunk = memories
+            .slice(offset, offset + 1000)
+            .filter(
+              (memory) =>
+                memory.isLatest !== false && memory.title && memory.content,
+            );
+          scanned += chunk.length;
+          await append(
+            chunk.map((memory) => ({
+              id: memory.id,
+              sessionId: memory.sessionIds?.[0] ?? "memory",
+              text: `${memory.title} ${memory.content}`,
+              updatedAt: memory.updatedAt || memory.createdAt,
+              ...(memory.project ? { project: memory.project } : {}),
+              ...(memory.agentId ? { agentId: memory.agentId } : {}),
+              kind: "memory" as const,
+              sourceVersion: memory.version,
+              ...(options.vector?.get(memory.id)?.embedding
+                ? { vector: options.vector.get(memory.id)!.embedding }
+                : {}),
+            })),
+          );
+        }
+        const sessions = await kv.list<Session>(KV.sessions);
+        for (const session of sessions) {
+          const observations = await kv
+            .list<CompressedObservation>(KV.observations(session.id))
+            .catch(() => {
+              failed++;
+              return [];
+            });
+          const eligible = observations.filter(
+            (observation) => observation.title && observation.narrative,
+          );
+          scanned += eligible.length;
+          for (let offset = 0; offset < eligible.length; offset += 1000) {
+            await append(
+              eligible.slice(offset, offset + 1000).map((observation) => ({
+                id: observation.id,
+                sessionId: observation.sessionId,
+                text: `${observation.title} ${observation.narrative}`,
+                updatedAt: observation.timestamp,
+                ...(session.project ? { project: session.project } : {}),
+                ...(observation.agentId
+                  ? { agentId: observation.agentId }
+                  : {}),
+                kind: "observation" as const,
+                ...(options.vector?.get(observation.id)?.embedding
+                  ? { vector: options.vector.get(observation.id)!.embedding }
+                  : {}),
+              })),
+            );
+          }
+        }
+        await lance.backend.ensureIndexes({
+          vector: lance.buildVectorIndex,
+        });
+        await lance.backend.optimize();
+        await lance.projection.finishBuild();
+        const status = await lance.backend.status();
+        const success = status.rowCount === indexed && failed === 0;
+        return {
+          state: success ? "succeeded" : "failed",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          scanned,
+          indexed,
+          failed,
+          ...(!success
+            ? {
+                error: `Lance count mismatch: table=${status.rowCount}, indexed=${indexed}, failed=${failed}`,
+              }
+            : {}),
+        };
+      } catch (error) {
+        return {
+          state: "failed",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          scanned,
+          indexed,
+          failed: failed + 1,
+          error: message(error),
+        };
+      }
+    };
+    lanceBuildPromise = task()
+      .then((status) => {
+        lanceBuildStatus = status;
+        return status;
+      })
+      .finally(() => {
+        lanceBuildPromise = null;
+      });
+    return lanceBuildPromise;
+  };
 
   const rebuild = (data: { batchSize?: number } = {}): Promise<IndexRebuildResult> => {
+    if (options.legacyMaintenanceEnabled === false) {
+      return Promise.resolve({
+        success: false,
+        bm25Count: options.bm25.size,
+        vectorCount: options.vector?.size ?? 0,
+        failed: 1,
+        failedIds: ["legacy-index-disabled"],
+        dimensions: options.embeddingProvider?.dimensions ?? 0,
+        error: "legacy index maintenance is disabled while Lance is authoritative",
+      });
+    }
     if (rebuildPromise) return rebuildPromise;
     if (repairPromise) {
       return Promise.resolve({
@@ -620,6 +824,21 @@ export function registerIndexMaintenanceFunctions(
   const getRebuildStatus = (): IndexRebuildJobStatus => ({ ...rebuildStatus });
 
   const repair = (data: IndexRepairOptions = {}): Promise<IndexRepairResult> => {
+    if (options.legacyMaintenanceEnabled === false) {
+      return Promise.resolve({
+        success: false,
+        scanned: 0,
+        missing: 0,
+        repaired: 0,
+        failed: 1,
+        failedIds: ["legacy-index-disabled"],
+        checkpoints: 0,
+        bm25Count: options.bm25.size,
+        vectorCount: options.vector?.size ?? 0,
+        dimensions: options.embeddingProvider?.dimensions ?? 0,
+        error: "legacy index maintenance is disabled while Lance is authoritative",
+      });
+    }
     if (repairPromise) return repairPromise;
     if (rebuildPromise) {
       return Promise.resolve({
@@ -705,7 +924,28 @@ export function registerIndexMaintenanceFunctions(
     dimensions: options.embeddingProvider?.dimensions ?? 0,
     rebuild: getRebuildStatus(),
     repair: getRepairStatus(),
+    searchBackend: options.lance
+      ? {
+          ...(await options.lance.backend.status()),
+          projection: options.lance.projection.getStatus(),
+          build: lanceBuildStatus,
+        }
+      : { backend: "legacy" },
   }));
+
+  sdk.registerFunction(
+    "mem::index-lance-build",
+    async (data: { background?: boolean } = {}) => {
+      if (data.background) {
+        const accepted = lanceBuildPromise === null;
+        void buildLance().catch((error) => {
+          logger.error("Lance shadow build failed", { error: message(error) });
+        });
+        return { accepted, ...lanceBuildStatus };
+      }
+      return buildLance();
+    },
+  );
 
   sdk.registerFunction("mem::index-flush", async () => {
     await options.persistence.save();
@@ -736,5 +976,6 @@ export function registerIndexMaintenanceFunctions(
     repair,
     startRepair,
     getRepairStatus,
+    buildLance,
   };
 }

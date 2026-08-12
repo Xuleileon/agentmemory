@@ -13,6 +13,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getSearchBackendConfig,
 } from "./config.js";
 import {
   createProvider,
@@ -38,6 +39,7 @@ import {
   setVectorIndex,
   setEmbeddingProvider,
   setIndexPersistence,
+  setSearchProjection,
 } from "./functions/search.js";
 import { registerIndexMaintenanceFunctions } from "./functions/index-maintenance.js";
 import { registerContextFunction } from "./functions/context.js";
@@ -104,6 +106,9 @@ import { bootLog } from "./logger.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { LanceSearchBackend } from "./state/lance-search-backend.js";
+import { SearchProjection } from "./state/search-projection.js";
+import type { SearchJournalEntry, Memory, CompressedObservation, Session } from "./types.js";
 
 // #640 + #474: the worker process (this file) is spawned by iii-exec
 // inside the engine. When `agentmemory stop` kills only the engine pid,
@@ -167,6 +172,7 @@ async function main() {
   const config = loadConfig();
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
+  const searchConfig = getSearchBackendConfig();
 
   const provider =
     fallbackConfig.providers.length > 0
@@ -227,10 +233,78 @@ async function main() {
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
-  const vectorIndex = embeddingProvider ? new VectorIndex() : null;
+  const vectorIndex =
+    embeddingProvider && searchConfig.mode !== "lance"
+      ? new VectorIndex()
+      : null;
 
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
+
+  let lanceBackend: LanceSearchBackend | null = null;
+  let searchProjection: SearchProjection | null = null;
+  if (searchConfig.mode !== "legacy") {
+    if (!embeddingProvider) {
+      throw new Error(
+        `AGENTMEMORY_SEARCH_BACKEND=${searchConfig.mode} requires an embedding provider`,
+      );
+    }
+    lanceBackend = new LanceSearchBackend(
+      searchConfig.path,
+      embeddingProvider.dimensions,
+    );
+    searchProjection = new SearchProjection(kv, lanceBackend, {
+      batchSize: searchConfig.batchSize,
+      batchMs: searchConfig.batchMs,
+      resolveRecord: async (entry: SearchJournalEntry) => {
+        const metadata = entry.record;
+        if (!metadata) return null;
+        let text: string;
+        let project = metadata.project;
+        let agentId = metadata.agentId;
+        let sourceVersion = metadata.sourceVersion;
+        if (metadata.kind === "memory") {
+          const memory = await kv.get<Memory>(KV.memories, metadata.id);
+          if (!memory || memory.isLatest === false) return null;
+          text = `${memory.title} ${memory.content}`;
+          project = memory.project;
+          agentId = memory.agentId;
+          sourceVersion = memory.version;
+        } else {
+          const observation = await kv.get<CompressedObservation>(
+            KV.observations(metadata.sessionId),
+            metadata.id,
+          );
+          if (!observation?.title || !observation.narrative) return null;
+          text = `${observation.title} ${observation.narrative}`;
+          agentId = observation.agentId;
+          if (!project) {
+            project = (
+              await kv.get<Session>(KV.sessions, metadata.sessionId)
+            )?.project;
+          }
+        }
+        const vector = await embeddingProvider.embed(text.slice(0, 16_000));
+        return {
+          id: metadata.id,
+          sessionId: metadata.sessionId,
+          text,
+          vector,
+          updatedAt: metadata.updatedAt,
+          ...(project ? { project } : {}),
+          ...(agentId ? { agentId } : {}),
+          ...(metadata.kind ? { kind: metadata.kind } : {}),
+          ...(sourceVersion !== undefined ? { sourceVersion } : {}),
+        };
+      },
+    });
+    await searchProjection.start();
+    setSearchProjection(searchProjection);
+    bootLog(
+      `Search backend: ${searchConfig.mode} (${searchConfig.path}, ` +
+        `${searchConfig.batchSize} records/${searchConfig.batchMs}ms)`,
+    );
+  }
 
   const meterAccessor = hasGetMeter(sdk)
     ? (sdk.getMeter.bind(sdk) as (name: string) => unknown)
@@ -383,6 +457,10 @@ async function main() {
     embeddingConfig.bm25Weight,
     embeddingConfig.vectorWeight,
     graphWeight,
+    process.env.RERANK_ENABLED === "true",
+    searchConfig.mode === "lance" && lanceBackend
+      ? lanceBackend
+      : undefined,
   );
 
   registerSmartSearchFunction(sdk, kv, (query, limit) =>
@@ -396,24 +474,41 @@ async function main() {
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
+  const legacyPersistenceAuto =
+    searchConfig.mode === "legacy" &&
+    searchConfig.legacyPersistence === "auto";
+  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex, {
+    autoSave: legacyPersistenceAuto,
+  });
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
   // restores the deleted entry at next boot.
-  setIndexPersistence(indexPersistence);
+  setIndexPersistence(
+    searchConfig.mode === "legacy" ? indexPersistence : null,
+  );
   const indexMaintenance = registerIndexMaintenanceFunctions(sdk, kv, {
     bm25: bm25Index,
     vector: vectorIndex,
     embeddingProvider,
     persistence: indexPersistence,
+    ...(lanceBackend && searchProjection
+      ? {
+          lance: {
+            backend: lanceBackend,
+            projection: searchProjection,
+            buildVectorIndex: searchConfig.buildVectorIndex,
+          },
+        }
+      : {}),
+    legacyMaintenanceEnabled: searchConfig.mode === "legacy",
   });
   registerSearchFunction(sdk, kv, async () => {
     const result = await indexMaintenance.rebuild();
     return result.success ? result.bm25Count : 0;
-  });
+  }, searchConfig.mode === "lance" && lanceBackend ? lanceBackend : undefined);
 
-  const loaded = await indexPersistence.load().catch((err) => {
+  const loaded = searchConfig.mode === "lance" ? null : await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted index:`, err);
     return null;
   });
@@ -477,7 +572,7 @@ async function main() {
     }
   }
 
-  const needsRebuild = bm25Index.size === 0;
+  const needsRebuild = searchConfig.mode !== "lance" && bm25Index.size === 0;
 
   if (needsRebuild) {
     // Build off-path so a provider error cannot leave a partial snapshot
@@ -543,6 +638,20 @@ async function main() {
         err,
       );
     }
+  }
+
+  if (
+    searchConfig.mode === "shadow" &&
+    searchConfig.buildOnStart &&
+    lanceBackend &&
+    searchProjection
+  ) {
+    void indexMaintenance.buildLance().then((result) => {
+      bootLog(
+        `Lance shadow build ${result.state}: ${result.indexed ?? 0} indexed, ` +
+          `${result.failed ?? 0} failed`,
+      );
+    });
   }
 
   // Ready / Endpoints lines are emitted via `bootLog` so they're
@@ -629,10 +738,17 @@ async function main() {
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();
+    searchProjection?.stop();
     await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
-    await indexPersistence.save().catch((err) => {
-      console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
+    if (legacyPersistenceAuto) {
+      await indexPersistence.save().catch((err) => {
+        console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
+      });
+    }
+    await searchProjection?.flush().catch((err) => {
+      console.warn(`[agentmemory] Failed to flush search projection:`, err);
     });
+    await lanceBackend?.close();
     await sdk.shutdown();
     clearWorkerPidfile();
     process.exit(0);

@@ -393,9 +393,12 @@ export async function handleToolCall(
       return await handleProxy(validated, handle);
     } catch (err) {
       process.stderr.write(
-        `[@agentmemory/mcp] proxy call failed for ${toolName}: ${err instanceof Error ? err.message : String(err)}; invalidating handle and falling back to local KV\n`,
+        `[@agentmemory/mcp] proxy call failed for ${toolName}: ${err instanceof Error ? err.message : String(err)}; invalidating handle\n`,
       );
       invalidateHandle();
+      if (toolName === "memory_recall" || toolName === "memory_smart_search") {
+        throw err;
+      }
     }
   }
   return handleLocal(validated, kvInstance);

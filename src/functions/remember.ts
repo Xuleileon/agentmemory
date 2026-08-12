@@ -12,6 +12,8 @@ import {
   vectorIndexRemove,
   scheduleIndexSave,
   flushIndexSave,
+  prepareSearchUpsert,
+  prepareSearchDelete,
 } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -140,6 +142,15 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           supersededMemory.isLatest = false;
           await kv.set(KV.memories, supersededMemory.id, supersededMemory);
         }
+        await prepareSearchUpsert({
+          id: memory.id,
+          sessionId: memory.sessionIds?.[0] ?? "memory",
+          updatedAt: memory.updatedAt,
+          ...(memory.project ? { project: memory.project } : {}),
+          ...(memory.agentId ? { agentId: memory.agentId } : {}),
+          kind: "memory",
+          sourceVersion: memory.version,
+        });
         await kv.set(KV.memories, memory.id, memory);
 
         // Without this, mem::remember persists the row but the BM25
@@ -198,6 +209,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       if (data.memoryId) {
         const mem = await kv.get<Memory>(KV.memories, data.memoryId);
         if (mem) {
+          await prepareSearchDelete(data.memoryId);
           await kv.delete(KV.memories, data.memoryId);
           if (mem.imageRef) {
             await decrementImageRef(kv, sdk, mem.imageRef);
@@ -220,6 +232,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             KV.observations(data.sessionId),
             obsId,
           );
+          await prepareSearchDelete(obsId);
           await kv.delete(KV.observations(data.sessionId), obsId);
           if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs?.imageRef && obs.imageRef !== obs.imageData) {
@@ -241,6 +254,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           KV.observations(data.sessionId),
         );
         for (const obs of observations) {
+          await prepareSearchDelete(obs.id);
           await kv.delete(KV.observations(data.sessionId), obs.id);
           if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs.imageRef && obs.imageRef !== obs.imageData) {
